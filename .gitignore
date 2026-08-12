@@ -1,0 +1,33 @@
+# macOS metadata
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Xcode build output and per-user settings
+build/
+DerivedData/
+*.xcuserstate
+*.xccheckout
+*.xcscmblueprint
+*.moved-aside
+*.xcodeproj/xcuserdata/
+*.xcworkspace/xcuserdata/
+
+# Swift Package Manager
+.build/
+.swiftpm/
+
+# Local temporary and release artifacts
+.tmp/
+dist/
+*.dmg
+*.dSYM
+*.dSYM.zip
+
+# Internal design notes
+# Public usage and build instructions live in README.md / README_EN.md.
+docs/
+
+# Regenerable icon intermediates and local backup
+App/Resources/AppIcon.iconset/
+App/Resources/AppIcon_副本.icns
