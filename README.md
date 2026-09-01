@@ -1,4 +1,6 @@
-![SuperRightClick 应用图标](./App/Resources/AppIcon-1024.png)
+<div align="center">
+<img src="./App/Resources/AppIcon-360.png" width="180" alt="SuperRightClick 应用图标">
+</div>
 
 # SuperRightClick
 

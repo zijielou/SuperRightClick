@@ -1,5 +1,5 @@
 <div align="center">
-  <img src="./App/Resources/AppIcon-1024.png" width="180" alt="SuperRightClick app icon">
+  <img src="./App/Resources/AppIcon-360.png" width="180" alt="SuperRightClick app icon">
   <h1>SuperRightClick</h1>
   <p><strong>A clean, configurable, and privacy-focused context menu extension for macOS Finder</strong></p>
 
