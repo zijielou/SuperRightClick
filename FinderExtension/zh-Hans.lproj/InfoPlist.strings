@@ -1,0 +1,3 @@
+"CFBundleDisplayName" = "SuperRightClick Finder 扩展";
+"CFBundleName" = "SuperRightClick Finder 扩展";
+"NSAppleEventsUsageDescription" = "用于在 Finder 新窗口或新标签页中打开用户选择的文件夹。";

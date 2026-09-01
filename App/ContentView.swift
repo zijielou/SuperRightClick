@@ -5,33 +5,42 @@ import UniformTypeIdentifiers
 @MainActor
 final class SettingsModel: ObservableObject {
     @Published var configuration: MenuConfiguration
-    private var observers: [NSObjectProtocol] = []
+    @Published private(set) var safetyPreferences: SafetyPreferences
+    private let observers = NotificationObservationBag()
+    private let safetyPreferencesStore: SafetyPreferencesStore
     private var lastSavedConfiguration: MenuConfiguration
 
-    init() {
+    init(safetyPreferencesStore: SafetyPreferencesStore = .production) {
+        self.safetyPreferencesStore = safetyPreferencesStore
         let initialConfiguration = ConfigurationStore.load()
         configuration = initialConfiguration
+        safetyPreferences = safetyPreferencesStore.load()
         lastSavedConfiguration = initialConfiguration
-        observers.append(ConfigurationStore.observeUpdates { [weak self] value in
+        observers.addLocal(ConfigurationStore.observeLocalUpdates { [weak self] value in
             guard let self else { return }
-            // 外部同步值已经持久化，先更新快照，避免 SwiftUI onChange
-            // 把相同配置再次广播回 Finder 扩展。
+            // 已成功持久化的进程内或外部同步值直接成为新快照，避免
+            // SwiftUI onChange 把相同配置再次广播给 Finder 扩展。
             self.lastSavedConfiguration = value
             self.configuration = value
         })
-        observers.append(ConfigurationStore.observeAppRequests())
+        observers.addLocal(SafetyPreferencesStore.observeLocalUpdates { [weak self] value in
+            self?.safetyPreferences = value
+        })
         ConfigurationStore.requestExtensionConfiguration()
     }
 
     func save() {
         guard configuration != lastSavedConfiguration else { return }
-        lastSavedConfiguration = configuration
-        ConfigurationStore.save(configuration)
+        let value = configuration
+        if ConfigurationStore.save(value) {
+            lastSavedConfiguration = value
+        }
     }
 
     func reset() {
         configuration = .default
         save()
+        resetPermanentDeleteConfirmation()
     }
 
     func resetMenuSettings() {
@@ -55,24 +64,25 @@ final class SettingsModel: ObservableObject {
     }
 
     func removeTemplate(id: UUID) {
-        guard let index = configuration.templates.firstIndex(where: { $0.id == id }) else { return }
-        let template = configuration.templates[index]
+        guard let template = configuration.templates.first(where: { $0.id == id }) else { return }
         let alert = NSAlert()
         alert.alertStyle = .warning
-        alert.messageText = "删除模板“\(template.name)”？"
-        alert.informativeText = template.kind == .custom
+        alert.messageText = f("删除模板“%@”？", template.name)
+        alert.informativeText = t(template.kind == .custom
             ? "该模板及 SuperRightClick 保存的模板副本会被删除，此操作无法撤销。"
-            : "该内置模板会从新建文件菜单中删除，可通过“重置本页”恢复。"
-        alert.addButton(withTitle: "删除")
-        alert.addButton(withTitle: "取消")
-        guard alert.runModal() == .alertFirstButtonReturn else { return }
-        configuration.templates.remove(at: index)
+            : "该内置模板会从新建文件菜单中删除，可通过“重置本页”恢复。")
+        alert.addButton(withTitle: t("删除"))
+        alert.addButton(withTitle: t("取消"))
+        guard alert.runModal() == .alertFirstButtonReturn,
+              let currentIndex = configuration.templates.firstIndex(where: { $0.id == id })
+        else { return }
+        configuration.templates.remove(at: currentIndex)
         save()
     }
 
     func importTemplate() {
         let panel = NSOpenPanel()
-        panel.title = "选择模板文件"
+        panel.title = t("选择模板文件")
         panel.canChooseDirectories = false
         panel.canChooseFiles = true
         panel.allowsMultipleSelection = false
@@ -104,6 +114,44 @@ final class SettingsModel: ObservableObject {
         configuration.hideCutItems = defaults.hideCutItems
         configuration.excludedPaths = defaults.excludedPaths
         save()
+        resetPermanentDeleteConfirmation()
+    }
+
+    func setPermanentDeleteConfirmation(_ value: Bool) {
+        guard value != safetyPreferences.confirmBeforePermanentDelete else { return }
+        if !value {
+            let alert = NSAlert()
+            alert.alertStyle = .critical
+            alert.messageText = t("关闭永久删除确认？")
+            alert.informativeText = t(
+                "关闭后，点击 Finder 菜单中的“永久删除”会立即删除项目，不经过废纸篓且无法撤销。"
+            )
+            alert.addButton(withTitle: t("关闭确认"))
+            alert.addButton(withTitle: t("取消"))
+            guard alert.runModal() == .alertFirstButtonReturn else { return }
+        }
+        savePermanentDeleteConfirmation(value)
+    }
+
+    private func resetPermanentDeleteConfirmation() {
+        savePermanentDeleteConfirmation(true)
+    }
+
+    private func savePermanentDeleteConfirmation(_ value: Bool) {
+        let previous = safetyPreferences
+        do {
+            safetyPreferences = try safetyPreferencesStore.save(
+                confirmBeforePermanentDelete: value
+            )
+        } catch {
+            safetyPreferences = previous
+            let alert = NSAlert()
+            alert.alertStyle = .critical
+            alert.messageText = t("无法保存永久删除安全设置")
+            alert.informativeText = errorText(error)
+            alert.addButton(withTitle: t("好"))
+            alert.runModal()
+        }
     }
 
     func addDirectory(common: Bool) {
@@ -150,7 +198,7 @@ final class SettingsModel: ObservableObject {
 
     func addOpenWithApp() {
         let panel = NSOpenPanel()
-        panel.title = "选择应用"
+        panel.title = t("选择应用")
         panel.canChooseDirectories = false
         panel.canChooseFiles = true
         panel.allowsMultipleSelection = false
@@ -227,7 +275,11 @@ final class SettingsModel: ObservableObject {
             }
             save()
         } catch {
-            let alert = NSAlert(error: error)
+            let alert = NSAlert()
+            alert.alertStyle = .critical
+            alert.messageText = t("操作失败")
+            alert.informativeText = errorText(error)
+            alert.addButton(withTitle: t("好"))
             alert.runModal()
         }
     }
@@ -249,6 +301,7 @@ final class SettingsModel: ObservableObject {
 
     private func pickDirectory() -> URL? {
         let panel = NSOpenPanel()
+        panel.title = t("选择文件夹")
         panel.canChooseDirectories = true
         panel.canChooseFiles = false
         panel.allowsMultipleSelection = false
@@ -261,11 +314,26 @@ final class SettingsModel: ObservableObject {
         return list.contains { $0.id != id && $0.resolvedURL.standardizedFileURL.path == path }
     }
 
+    private func t(_ value: String) -> String {
+        Localizer.text(value, language: configuration.language)
+    }
+
+    private func f(_ value: String, _ arguments: CVarArg...) -> String {
+        Localizer.format(value, language: configuration.language, arguments: arguments)
+    }
+
+    private func errorText(_ error: Error) -> String {
+        if let secureFailure = error as? SecureFileFailure {
+            return secureFailure.message(language: configuration.language)
+        }
+        return Localizer.systemErrorText(error, language: configuration.language)
+    }
+
     private func showDuplicateAlert(path: String) {
         let alert = NSAlert()
-        alert.messageText = "目录已存在"
-        alert.informativeText = "该目录已在列表中：\n\(path)"
-        alert.addButton(withTitle: "好")
+        alert.messageText = t("目录已存在")
+        alert.informativeText = f("该目录已在列表中：\n%@", path)
+        alert.addButton(withTitle: t("好"))
         alert.runModal()
     }
 }
@@ -308,14 +376,16 @@ struct ContentView: View {
             GroupBox(t("权限状态")) {
                 VStack(alignment: .leading, spacing: 8) {
                     Text(
-                        isAccessibilityTrusted ? "辅助功能已授权" : "辅助功能未授权（新建后重命名需要）"
+                        t(isAccessibilityTrusted
+                            ? "辅助功能已授权"
+                            : "辅助功能未授权（新建后重命名需要）")
                     )
                     .foregroundStyle(isAccessibilityTrusted ? Color.green : Color.orange)
                     HStack {
-                        Button("请求辅助功能授权") {
+                        Button(t("请求辅助功能授权")) {
                             requestAccessibilityAuthorization()
                         }
-                        Button("完全磁盘访问") {
+                        Button(t("完全磁盘访问")) {
                             openSystemSettings("Privacy_AllFiles")
                         }
                     }
@@ -340,9 +410,9 @@ struct ContentView: View {
     private var templatesView: some View {
         Form {
             HStack {
-                Button("导入模板…") { model.importTemplate() }
+                Button(t("导入模板…")) { model.importTemplate() }
                 Spacer()
-                Button("重置本页") { model.resetTemplates() }
+                Button(t("重置本页")) { model.resetTemplates() }
             }
             Toggle(t("新建后自动打开"), isOn: binding(\.autoOpenNewFile))
             Toggle(t("创建成功时播放声音"), isOn: binding(\.playCreationSound))
@@ -350,31 +420,31 @@ struct ContentView: View {
                 List {
                     ForEach($model.configuration.templates) { $template in
                         HStack(spacing: 8) {
-                            Toggle("启用", isOn: $template.isEnabled)
+                            Toggle(t("启用"), isOn: $template.isEnabled)
                                 .labelsHidden()
-                                .help("在新建文件菜单中显示此模板")
-                            TextField("模板名称", text: $template.name)
+                                .help(t("在新建文件菜单中显示此模板"))
+                            TextField(t("模板名称"), text: $template.name)
                                 .textFieldStyle(.roundedBorder)
                                 .frame(minWidth: 110)
                                 .onSubmit { model.save() }
                             Text(".")
                                 .foregroundStyle(.secondary)
-                            TextField("后缀", text: $template.fileExtension)
+                            TextField(t("后缀"), text: $template.fileExtension)
                                 .textFieldStyle(.roundedBorder)
                                 .frame(width: 72)
                                 .onSubmit { model.save() }
-                            Picker("图标", selection: $template.iconVariant) {
-                                Text("文档").tag(Optional(0))
-                                Text("文本").tag(Optional(1))
-                                Text("圆形").tag(Optional(2))
-                                Text("代码").tag(Optional(3))
+                            Picker(t("图标"), selection: $template.iconVariant) {
+                                Text(t("文档")).tag(Optional(0))
+                                Text(t("文本")).tag(Optional(1))
+                                Text(t("圆形")).tag(Optional(2))
+                                Text(t("代码")).tag(Optional(3))
                             }
                             .frame(width: 108)
-                            Toggle("一级菜单", isOn: $template.showInMainMenu)
-                            Button("删除", role: .destructive) {
+                            Toggle(t("一级菜单"), isOn: $template.showInMainMenu)
+                            Button(t("删除"), role: .destructive) {
                                 model.removeTemplate(id: template.id)
                             }
-                            .help("删除此新建文件模板")
+                            .help(t("删除此新建文件模板"))
                         }
                     }
                     .onMove { indices, destination in
@@ -393,7 +463,7 @@ struct ContentView: View {
             VStack(spacing: 16) {
                 HStack {
                     Spacer()
-                    Button("重置本页") { model.resetDirectories() }
+                    Button(t("重置本页")) { model.resetDirectories() }
                 }
                 directoryList(
                     title: t("常用目录（名称可直接修改，例如 Desktop 改为“桌面”）"),
@@ -412,7 +482,7 @@ struct ContentView: View {
     }
 
     private var openWithAppList: some View {
-        GroupBox("用 App 打开") {
+        GroupBox(t("用 App 打开")) {
             VStack {
                 List {
                     ForEach($model.configuration.openWithApps) { $app in
@@ -422,20 +492,20 @@ struct ContentView: View {
                                 .resizable()
                                 .frame(width: 22, height: 22)
                             VStack(alignment: .leading, spacing: 2) {
-                                TextField("名称", text: $app.name)
+                                TextField(t("名称"), text: appNameBinding($app))
                                 Text(app.appPath)
                                     .font(.caption)
                                     .foregroundStyle(app.isInstalled ? Color.secondary : Color.red)
                                     .lineLimit(1)
                                     .truncationMode(.middle)
                                 if !app.isInstalled {
-                                    Text("应用未安装，菜单中已自动隐藏")
+                                    Text(t("应用未安装，菜单中已自动隐藏"))
                                         .font(.caption2)
                                         .foregroundStyle(.red)
                                 }
                             }
                             Spacer()
-                            Button("删除", role: .destructive) {
+                            Button(t("删除"), role: .destructive) {
                                 model.removeOpenWithApp(id: app.id)
                             }
                         }
@@ -447,9 +517,9 @@ struct ContentView: View {
                 }
                 .frame(minHeight: 170)
                 HStack {
-                    Button("添加…") { model.addOpenWithApp() }
+                    Button(t("添加…")) { model.addOpenWithApp() }
                     Spacer()
-                    Text("终端、Cursor 等")
+                    Text(t("终端、Cursor 等"))
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
@@ -464,7 +534,7 @@ struct ContentView: View {
                 Toggle(t("显示菜单图标"), isOn: binding(\.showMenuIcons))
                 Toggle(t("显示菜单栏图标"), isOn: binding(\.showMenuBarIcon))
                 Spacer()
-                Button("重置本页") { model.resetMenuSettings() }
+                Button(t("重置本页")) { model.resetMenuSettings() }
             }
             HStack {
                 Toggle(t("合并文件操作"), isOn: binding(\.mergeFileOperations))
@@ -472,30 +542,30 @@ struct ContentView: View {
                 Toggle(t("合并图片转换"), isOn: binding(\.mergeImageOperations))
                 Picker(t("语言"), selection: binding(\.language)) {
                     ForEach(AppLanguage.allCases, id: \.self) { language in
-                        Text(language.displayName).tag(language)
+                        Text(language.displayName(in: model.configuration.language)).tag(language)
                     }
                 }
                 .frame(width: 190)
             }
-            Text("可启停、改名、拖动排序，并为单项设置自定义图标。")
+            Text(t("可启停、改名、拖动排序，并为单项设置自定义图标。"))
                 .font(.caption)
                 .foregroundStyle(.secondary)
             List {
                 ForEach($model.configuration.actionPreferences) { $preference in
                     HStack {
                         Toggle("", isOn: $preference.isEnabled).labelsHidden()
-                        Text(preference.action.title)
+                        Text(t(preference.action.title))
                             .frame(width: 160, alignment: .leading)
-                        TextField("自定义名称", text: Binding(
+                        TextField(t("自定义名称"), text: Binding(
                             get: { preference.customName ?? "" },
                             set: { preference.customName = $0.isEmpty ? nil : $0 }
                         ))
-                        Toggle("图标", isOn: $preference.showIcon)
-                        Button("自定义图标…") {
+                        Toggle(t("图标"), isOn: $preference.showIcon)
+                        Button(t("自定义图标…")) {
                             model.chooseCustomIcon(for: preference.action)
                         }
                         if preference.customIconPath != nil {
-                            Button("恢复") {
+                            Button(t("恢复")) {
                                 model.clearCustomIcon(for: preference.action)
                             }
                         }
@@ -517,19 +587,19 @@ struct ContentView: View {
         Form {
             HStack {
                 Spacer()
-                Button("重置本页") { model.resetImageSettings() }
+                Button(t("重置本页")) { model.resetImageSettings() }
             }
             Section(t("图片转换")) {
                 HStack {
-                    Text("有损格式质量")
+                    Text(t("有损格式质量"))
                     Slider(value: binding(\.imageQuality), in: 0.1...1, step: 0.05)
                     Text("\(Int(model.configuration.imageQuality * 100))%")
                         .monospacedDigit()
                         .frame(width: 45)
                 }
-                TextField("JPG 透明背景填充色（#RRGGBB）", text: binding(\.jpgBackgroundHex))
+                TextField(t("JPG 透明背景填充色（#RRGGBB）"), text: binding(\.jpgBackgroundHex))
                 Toggle(t("墙纸应用到全部屏幕"), isOn: binding(\.wallpaperAllScreens))
-                Text("转换结果保存在源图片旁边；同名时自动追加序号。")
+                Text(t("转换结果保存在源图片旁边；同名时自动追加序号。"))
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -540,7 +610,7 @@ struct ContentView: View {
         Form {
             HStack {
                 Spacer()
-                Button("重置本页") { model.resetAdvancedSettings() }
+                Button(t("重置本页")) { model.resetAdvancedSettings() }
             }
             Toggle(t("文件操作合并为二级菜单"), isOn: binding(\.mergeFileOperations))
             Section(t("高风险功能（默认关闭）")) {
@@ -548,9 +618,22 @@ struct ContentView: View {
                 Toggle(t("修改写入权限"), isOn: binding(\.enablePermissionChanges))
                 Toggle(t("解散文件夹"), isOn: binding(\.enableDissolveFolder))
                 Toggle(t("永久删除"), isOn: binding(\.enablePermanentDelete))
+                Toggle(
+                    t("永久删除前要求确认（强烈建议）"),
+                    isOn: Binding(
+                        get: { model.safetyPreferences.confirmBeforePermanentDelete },
+                        set: { model.setPermanentDeleteConfirmation($0) }
+                    )
+                )
+                .disabled(!model.configuration.enablePermanentDelete)
+                .padding(.leading, 20)
             }
-            Text("永久删除不经过废纸篓；每次操作都会强制确认。")
-                .foregroundStyle(.red)
+            Text(t(
+                model.safetyPreferences.confirmBeforePermanentDelete
+                    ? "永久删除不经过废纸篓；删除前会要求确认。"
+                    : "永久删除不经过废纸篓；点击菜单后将立即删除，无法撤销。"
+            ))
+            .foregroundStyle(.red)
             Section(t("行为")) {
                 Toggle(t("操作成功时播放声音"), isOn: binding(\.playOperationSound))
                 Toggle(t("剪切时临时隐藏文件"), isOn: binding(\.hideCutItems))
@@ -560,13 +643,13 @@ struct ContentView: View {
                     HStack {
                         Text(path).lineLimit(1).truncationMode(.middle)
                         Spacer()
-                        Button("删除", role: .destructive) {
+                        Button(t("删除"), role: .destructive) {
                             model.configuration.excludedPaths.removeAll { $0 == path }
                             model.save()
                         }
                     }
                 }
-                Button("添加排除目录…") { model.addExcludedPath() }
+                Button(t("添加排除目录…")) { model.addExcludedPath() }
             }
         }
     }
@@ -583,7 +666,7 @@ struct ContentView: View {
                         HStack(spacing: 8) {
                             Toggle("", isOn: $value.isEnabled).labelsHidden()
                             VStack(alignment: .leading, spacing: 2) {
-                                TextField("菜单显示名称", text: $value.name)
+                                TextField(t("菜单显示名称"), text: directoryNameBinding($value))
                                     .onSubmit { model.save() }
                                 Text(value.path)
                                     .font(.caption)
@@ -595,10 +678,10 @@ struct ContentView: View {
                                     .truncationMode(.middle)
                             }
                             Spacer()
-                            Button("换路径") {
+                            Button(t("换路径")) {
                                 model.changeDirectoryPath(id: value.id, common: common)
                             }
-                            Button("删除", role: .destructive) {
+                            Button(t("删除"), role: .destructive) {
                                 model.removeDirectory(id: value.id, common: common)
                             }
                         }
@@ -614,14 +697,28 @@ struct ContentView: View {
                 }
                 .frame(minHeight: 170)
                 HStack {
-                    Button("添加…") { model.addDirectory(common: common) }
+                    Button(t("添加…")) { model.addDirectory(common: common) }
                     Spacer()
-                    Text("名称可直接编辑，拖动可排序")
+                    Text(t("名称可直接编辑，拖动可排序"))
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
             }
         }
+    }
+
+    private func appNameBinding(_ value: Binding<AppShortcut>) -> Binding<String> {
+        Binding(
+            get: { value.wrappedValue.displayName(language: model.configuration.language) },
+            set: { value.wrappedValue.name = $0 }
+        )
+    }
+
+    private func directoryNameBinding(_ value: Binding<DirectoryShortcut>) -> Binding<String> {
+        Binding(
+            get: { value.wrappedValue.displayName(language: model.configuration.language) },
+            set: { value.wrappedValue.name = $0 }
+        )
     }
 
     private func binding<Value>(_ keyPath: WritableKeyPath<MenuConfiguration, Value>) -> Binding<Value> {

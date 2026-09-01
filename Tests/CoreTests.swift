@@ -1,10 +1,49 @@
 import AppKit
+import Darwin
 import ImageIO
 import UniformTypeIdentifiers
 import XCTest
 
 private final class MenuTarget: NSObject {
     @objc func perform(_ sender: NSMenuItem) {}
+}
+
+private final class ConcurrentImageResults: @unchecked Sendable {
+    private let lock = NSLock()
+    private var urls: [URL] = []
+    private var errors: [String] = []
+
+    func record(_ result: Result<URL, Error>) {
+        lock.lock()
+        defer { lock.unlock() }
+        switch result {
+        case let .success(url):
+            urls.append(url)
+        case let .failure(error):
+            errors.append(error.localizedDescription)
+        }
+    }
+
+    func snapshot() -> (urls: [URL], errors: [String]) {
+        lock.lock()
+        defer { lock.unlock() }
+        return (urls, errors)
+    }
+}
+
+@MainActor
+private final class PermanentDeleteConfirmationStub {
+    private(set) var requestedURLs: [[URL]] = []
+    var approved: Bool
+
+    init(approved: Bool) {
+        self.approved = approved
+    }
+
+    func confirm(_ urls: [URL]) async -> Bool {
+        requestedURLs.append(urls)
+        return approved
+    }
 }
 
 final class CoreTests: XCTestCase {
@@ -29,14 +68,27 @@ final class CoreTests: XCTestCase {
         }
     }
 
-    /// 一律使用隔离的 UserDefaults 且不广播，避免测试数据污染真实配置。
+    /// 一律使用隔离的 UserDefaults 和安全偏好目录且不广播，避免测试数据污染真实配置。
     @MainActor
-    private func makeCoordinator(templateStorage: URL? = nil) -> FeatureCoordinator {
+    private func makeCoordinator(
+        templateStorage: URL? = nil,
+        requiresConfirmation: Bool = false,
+        safetyPreferencesStore: SafetyPreferencesStore? = nil,
+        permanentDeleteConfirmation: PermanentDeleteConfirmationProvider? = nil,
+        permanentDeletionWillIsolate: (@MainActor (URL) -> Void)? = nil,
+        errorPresentation: (@MainActor (String) -> Void)? = nil
+    ) -> FeatureCoordinator {
         FeatureCoordinator(
-            requiresConfirmation: false,
+            requiresConfirmation: requiresConfirmation,
             templateStorageURL: templateStorage,
             configurationDefaults: isolatedDefaults,
-            publishChanges: false
+            publishChanges: false,
+            safetyPreferencesStore: safetyPreferencesStore ?? SafetyPreferencesStore(
+                directoryURL: root.appendingPathComponent("SafetyPreferences", isDirectory: true)
+            ),
+            permanentDeleteConfirmation: permanentDeleteConfirmation,
+            permanentDeletionWillIsolate: permanentDeletionWillIsolate,
+            errorPresentation: errorPresentation
         )
     }
 
@@ -66,21 +118,308 @@ final class CoreTests: XCTestCase {
         defer { defaults.removePersistentDomain(forName: suite) }
         var configuration = MenuConfiguration.default
         configuration.enablePermanentDelete = true
-        ConfigurationStore.save(configuration, defaults: defaults, publish: false)
+        configuration.language = .english
+        XCTAssertTrue(ConfigurationStore.save(configuration, defaults: defaults, publish: false))
         XCTAssertEqual(ConfigurationStore.load(defaults: defaults), configuration)
+        XCTAssertEqual(ConfigurationStore.load(defaults: defaults).language, .english)
     }
 
-    /// 旧版本存储的配置没有 openWithApps 字段，解码时必须回填默认应用而不是解码失败。
-    func testLegacyConfigurationDecodesWithDefaultApps() throws {
+    func testConfigurationSaveFailureDoesNotAdvanceStoredValue() throws {
+        var invalid = MenuConfiguration.default
+        invalid.imageQuality = .infinity
+        XCTAssertFalse(ConfigurationStore.save(invalid, defaults: isolatedDefaults, publish: false))
+        XCTAssertFalse(ConfigurationStore.hasStoredConfiguration(defaults: isolatedDefaults))
+    }
+
+    func testSafetyPreferencesDefaultSaveAndFailClosedLoading() throws {
+        let store = SafetyPreferencesStore(
+            directoryURL: root.appendingPathComponent("safety", isDirectory: true)
+        )
+        XCTAssertTrue(store.load().confirmBeforePermanentDelete)
+
+        let disabled = try store.save(confirmBeforePermanentDelete: false)
+        XCTAssertFalse(store.load().confirmBeforePermanentDelete)
+        let attributes = try FileManager.default.attributesOfItem(atPath: store.fileURL.path)
+        XCTAssertEqual((attributes[.posixPermissions] as? NSNumber)?.intValue, 0o600)
+
+        let enabled = try store.save(confirmBeforePermanentDelete: true)
+        XCTAssertTrue(enabled.confirmBeforePermanentDelete)
+        XCTAssertNotEqual(enabled.revision, disabled.revision)
+
+        try Data("not-json".utf8).write(to: store.fileURL, options: .atomic)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o600],
+            ofItemAtPath: store.fileURL.path
+        )
+        XCTAssertTrue(store.load().confirmBeforePermanentDelete)
+    }
+
+    func testSafetyPreferencesRejectsSymlinkAndUnknownSchema() throws {
+        let validStore = SafetyPreferencesStore(
+            directoryURL: root.appendingPathComponent("valid-safety", isDirectory: true)
+        )
+        _ = try validStore.save(confirmBeforePermanentDelete: false)
+
+        let linkedStore = SafetyPreferencesStore(
+            directoryURL: root.appendingPathComponent("linked-safety", isDirectory: true)
+        )
+        try FileManager.default.createDirectory(
+            at: linkedStore.directoryURL,
+            withIntermediateDirectories: true,
+            attributes: [.posixPermissions: 0o700]
+        )
+        try FileManager.default.createSymbolicLink(
+            at: linkedStore.fileURL,
+            withDestinationURL: validStore.fileURL
+        )
+        XCTAssertTrue(linkedStore.load().confirmBeforePermanentDelete)
+
+        var unknown = try JSONDecoder().decode(
+            SafetyPreferences.self,
+            from: Data(contentsOf: validStore.fileURL)
+        )
+        unknown.schemaVersion += 1
+        try JSONEncoder().encode(unknown).write(to: validStore.fileURL, options: .atomic)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o600],
+            ofItemAtPath: validStore.fileURL.path
+        )
+        XCTAssertTrue(validStore.load().confirmBeforePermanentDelete)
+    }
+
+    func testDestructiveConfirmationRequestFileValidation() throws {
+        let first = root.appendingPathComponent("first.txt")
+        let second = root.appendingPathComponent("second.txt")
+        let request = DestructiveConfirmationBridge.makeRequest(
+            for: [first, second],
+            replySocketPath: "/tmp/superrightclick-test.sock"
+        )
+        let directory = root.appendingPathComponent("requests", isDirectory: true)
+        let requestURL = try DestructiveConfirmationBridge.writeRequest(
+            request,
+            directoryURL: directory
+        )
+        defer { DestructiveConfirmationBridge.removeRequest(at: requestURL) }
+
+        XCTAssertEqual(try DestructiveConfirmationBridge.readRequest(at: requestURL), request)
+        let attributes = try FileManager.default.attributesOfItem(atPath: requestURL.path)
+        XCTAssertEqual((attributes[.posixPermissions] as? NSNumber)?.intValue, 0o600)
+        XCTAssertEqual(DestructiveConfirmationBridge.requestID(from: requestURL), request.id)
+
+        let stale = DestructiveConfirmationRequest(
+            id: UUID(),
+            createdAt: Date().addingTimeInterval(
+                -(DestructiveConfirmationBridge.responseTimeoutSeconds + 1)
+            ),
+            action: .permanentDelete,
+            paths: [first.path],
+            confirmationMode: .standard,
+            replySocketPath: "/tmp/superrightclick-stale-test.sock"
+        )
+        let staleURL = try DestructiveConfirmationBridge.writeRequest(
+            stale,
+            directoryURL: directory
+        )
+        defer { DestructiveConfirmationBridge.removeRequest(at: staleURL) }
+        XCTAssertThrowsError(try DestructiveConfirmationBridge.readRequest(at: staleURL))
+    }
+
+    func testAuthenticatedConfirmationReplyChannel() async throws {
+        let expectedCodeHash = try XCTUnwrap(
+            HostCodeIdentity.codeHash(processIdentifier: getpid())
+        )
+        let expectedRequestDigest = Data("expected-request-context".utf8)
+        let requestID = UUID()
+        let server = try AuthenticatedDestructiveConfirmationServer(
+            socketPath: AuthenticatedDestructiveConfirmationServer.makeSocketPath(),
+            requestID: requestID,
+            expectedHostCodeHash: expectedCodeHash,
+            expectedRequestDigest: expectedRequestDigest
+        )
+        defer { server.invalidate() }
+        let responseTask = Task.detached(priority: .userInitiated) {
+            server.receiveResponse()
+        }
+        try DestructiveConfirmationBridge.sendResponse(
+            DestructiveConfirmationResponse(
+                requestID: requestID,
+                requestDigest: expectedRequestDigest,
+                approved: true
+            ),
+            toSocketPath: server.socketPath
+        )
+        let accepted = await responseTask.value
+        XCTAssertTrue(accepted)
+
+        let rejectedRequestID = UUID()
+        let rejectedServer = try AuthenticatedDestructiveConfirmationServer(
+            socketPath: AuthenticatedDestructiveConfirmationServer.makeSocketPath(),
+            requestID: rejectedRequestID,
+            expectedHostCodeHash: Data(repeating: 0, count: expectedCodeHash.count),
+            expectedRequestDigest: expectedRequestDigest
+        )
+        let rejectedTask = Task.detached(priority: .userInitiated) {
+            rejectedServer.receiveResponse()
+        }
+        try DestructiveConfirmationBridge.sendResponse(
+            DestructiveConfirmationResponse(
+                requestID: rejectedRequestID,
+                requestDigest: expectedRequestDigest,
+                approved: true
+            ),
+            toSocketPath: rejectedServer.socketPath
+        )
+        try await Task.sleep(for: .milliseconds(50))
+        rejectedServer.invalidate()
+        let rejected = await rejectedTask.value
+        XCTAssertFalse(rejected)
+
+        let substitutedRequestID = UUID()
+        let substitutedServer = try AuthenticatedDestructiveConfirmationServer(
+            socketPath: AuthenticatedDestructiveConfirmationServer.makeSocketPath(),
+            requestID: substitutedRequestID,
+            expectedHostCodeHash: expectedCodeHash,
+            expectedRequestDigest: expectedRequestDigest
+        )
+        let substitutedTask = Task.detached(priority: .userInitiated) {
+            substitutedServer.receiveResponse()
+        }
+        try DestructiveConfirmationBridge.sendResponse(
+            DestructiveConfirmationResponse(
+                requestID: substitutedRequestID,
+                requestDigest: Data("substituted-request-context".utf8),
+                approved: true
+            ),
+            toSocketPath: substitutedServer.socketPath
+        )
+        try await Task.sleep(for: .milliseconds(50))
+        substitutedServer.invalidate()
+        let substituted = await substitutedTask.value
+        XCTAssertFalse(substituted)
+    }
+
+    func testPermanentDeleteSafetyPreferenceIsNotStoredInMenuConfiguration() throws {
+        let object = try XCTUnwrap(
+            JSONSerialization.jsonObject(
+                with: JSONEncoder().encode(MenuConfiguration.default)
+            ) as? [String: Any]
+        )
+        XCTAssertNil(object["confirmBeforePermanentDelete"])
+    }
+
+    /// 旧版本存储的配置没有 openWithApps/language 字段，解码时必须回填默认值。
+    func testLegacyConfigurationDecodesWithDefaultAppsAndSystemLanguage() throws {
         var object = try XCTUnwrap(
             JSONSerialization.jsonObject(
                 with: JSONEncoder().encode(MenuConfiguration.default)
             ) as? [String: Any]
         )
         object.removeValue(forKey: "openWithApps")
+        object.removeValue(forKey: "language")
         let legacyData = try JSONSerialization.data(withJSONObject: object)
         let decoded = try JSONDecoder().decode(MenuConfiguration.self, from: legacyData)
         XCTAssertEqual(decoded.openWithApps.map(\.name), ["终端", "Visual Studio Code"])
+        XCTAssertEqual(decoded.language, .system)
+    }
+
+    func testCompleteEnglishLocalizationAndCustomNames() throws {
+        XCTAssertEqual(
+            Localizer.resolvedLanguage(.system, preferredLanguages: ["fr-FR"]),
+            .english
+        )
+        XCTAssertEqual(
+            Localizer.resolvedLanguage(.system, preferredLanguages: ["zh-Hant-HK"]),
+            .traditionalChinese
+        )
+        XCTAssertEqual(
+            Localizer.resolvedLanguage(.system, preferredLanguages: ["zh-Hans-CN"]),
+            .simplifiedChinese
+        )
+
+        for action in FinderMenuAction.allCases {
+            XCTAssertTrue(
+                Localizer.hasTranslation(action.title, language: .english),
+                "Missing English action title: \(action.title)"
+            )
+            XCTAssertTrue(
+                Localizer.hasTranslation(action.title, language: .traditionalChinese),
+                "Missing Traditional Chinese action title: \(action.title)"
+            )
+            let englishTitle = Localizer.text(action.title, language: .english)
+            XCTAssertFalse(
+                englishTitle.unicodeScalars.contains { (0x4E00...0x9FFF).contains($0.value) },
+                "English action title contains Chinese: \(action.title)"
+            )
+        }
+
+        let dynamicKeys = [
+            "新建 %@", "用 %@ 打开", "新建%@文件", "未命名",
+            "删除模板“%@”？", "关闭永久删除确认？", "打开设置", "退出",
+            "将永久删除 1 个项目，此操作不经过废纸篓且无法撤销。",
+            "将永久删除 %@ 个项目，此操作不经过废纸篓且无法撤销。",
+            "文件名不能为空，也不能包含“/”。", "文件名过长。", "文件后缀无效。",
+            "模板已不存在。", "没有启用的新建模板。", "通过窗口创建新文件",
+            "模板“%@”已添加。", "%@：%@", "选择移动目标文件夹",
+            "选择复制目标文件夹", "剪贴板中没有可粘贴的文件。",
+            "文件信息与摘要", "路径：%@", "大小：%@", "修改：%@", "读取失败：%@",
+            "找不到应用：%@", "隐藏全部项目", "显示全部项目",
+            "将修改“%@”第一层的 %@ 个项目，是否继续？",
+            "所选内容包含受保护路径。", "不能解散受保护目录。",
+            "拒绝删除根目录、主目录或系统保护路径。",
+            "永久删除目标在确认期间发生变化，已取消操作。",
+            "永久删除目标在确认期间已被替换，已取消操作。",
+            "无法打开永久删除目标目录（POSIX 错误 %@）。",
+            "永久删除目标在提交期间已被替换，已取消操作。",
+            "无法安全隔离永久删除目标（POSIX 错误 %@）。",
+            "无法生成唯一的永久删除隔离路径。",
+            "永久删除目标身份复核失败，已恢复原路径并取消操作。",
+            "永久删除目标身份复核失败，且无法恢复原路径；项目保留在 %@（POSIX 错误 %@）。",
+            "无法删除已隔离的永久删除目标；剩余项目位于 %@（POSIX 错误 %@）。",
+            "无法删除已隔离的永久删除目标；剩余项目位于 %@：%@",
+            "Finder 自动化失败：%@", "无法读取图片。",
+            "当前 macOS 不支持编码 %@。", "无法创建输出图片。", "图片编码失败。",
+            "操作失败", "系统错误（%@，代码 %@）。",
+        ]
+        for key in dynamicKeys {
+            XCTAssertTrue(Localizer.hasTranslation(key, language: .english), key)
+            XCTAssertTrue(Localizer.hasTranslation(key, language: .traditionalChinese), key)
+        }
+
+        var configuration = MenuConfiguration.default
+        configuration.language = .english
+        let copyPathIndex = try XCTUnwrap(configuration.actionPreferences.firstIndex {
+            $0.action == .copyPath
+        })
+        configuration.actionPreferences[copyPathIndex].customName = "  用户 %@ 名称  "
+        XCTAssertEqual(configuration.title(for: .copyPath), "  用户 %@ 名称  ")
+        configuration.actionPreferences[copyPathIndex].customName = "   \n"
+        XCTAssertEqual(configuration.title(for: .copyPath), "Copy Path")
+
+        XCTAssertEqual(
+            Localizer.format("用 %@ 打开", language: .english, "Tool %@ 100%"),
+            "Open with Tool %@ 100%"
+        )
+        XCTAssertEqual(
+            OperationFailure("当前 macOS 不支持编码 %@。", arguments: ["WEBP"])
+                .message(language: .english),
+            "This version of macOS does not support WEBP encoding."
+        )
+    }
+
+    func testBuiltinShortcutNamesLocalizeWithoutChangingUserNames() {
+        let downloads = MenuConfiguration.default.commonDirectories[0]
+        XCTAssertEqual(downloads.displayName(language: .english), "Downloads")
+        var renamedDirectory = downloads
+        renamedDirectory.name = "我的下载"
+        XCTAssertEqual(renamedDirectory.displayName(language: .english), "我的下载")
+
+        let terminal = MenuConfiguration.defaultOpenWithApps[0]
+        XCTAssertEqual(terminal.displayName(language: .english), "Terminal")
+        XCTAssertTrue(terminal.usesDefaultTerminalName)
+        var renamedTerminal = terminal
+        renamedTerminal.name = "我的终端"
+        XCTAssertEqual(renamedTerminal.displayName(language: .english), "我的终端")
+        XCTAssertFalse(renamedTerminal.usesDefaultTerminalName)
     }
 
     func testTemplateDeduplication() throws {
@@ -116,6 +455,9 @@ final class CoreTests: XCTestCase {
     func testCustomTemplateAndKnownHashes() throws {
         let templateStorage = root.appendingPathComponent("templates", isDirectory: true)
         let coordinator = makeCoordinator(templateStorage: templateStorage)
+        var configuration = MenuConfiguration.default
+        configuration.language = .simplifiedChinese
+        coordinator.updateConfiguration(configuration)
         let source = root.appendingPathComponent("sample.docx")
         try Data("abc".utf8).write(to: source)
         let template = try coordinator.registerTemplate(from: source, name: "我的 Word")
@@ -136,13 +478,30 @@ final class CoreTests: XCTestCase {
     @MainActor
     func testBuiltinTemplateCreation() throws {
         let coordinator = makeCoordinator()
-        let configuration = MenuConfiguration.default
+        var configuration = MenuConfiguration.default
+        configuration.language = .simplifiedChinese
         coordinator.updateConfiguration(configuration)
         let template = try XCTUnwrap(configuration.templates.first { $0.kind == .xml })
         coordinator.create(templateID: template.id, in: root)
         let output = root.appendingPathComponent("未命名.xml")
         XCTAssertTrue(FileManager.default.fileExists(atPath: output.path))
         XCTAssertTrue(try String(contentsOf: output, encoding: .utf8).hasPrefix("<?xml"))
+    }
+
+    @MainActor
+    func testEnglishTemplateCreationUsesLocalizedUntitledName() throws {
+        let coordinator = makeCoordinator()
+        var configuration = MenuConfiguration.default
+        configuration.language = .english
+        coordinator.updateConfiguration(configuration)
+        let template = try XCTUnwrap(configuration.templates.first { $0.kind == .xml })
+        coordinator.create(templateID: template.id, in: root)
+        XCTAssertTrue(FileManager.default.fileExists(
+            atPath: root.appendingPathComponent("Untitled.xml").path
+        ))
+        XCTAssertFalse(FileManager.default.fileExists(
+            atPath: root.appendingPathComponent("未命名.xml").path
+        ))
     }
 
     @MainActor
@@ -260,6 +619,34 @@ final class CoreTests: XCTestCase {
         XCTAssertEqual(builder.command(forTag: first.tag)?.action, .copyPath)
     }
 
+    @MainActor
+    func testMenuCommandsBindBuildContext() throws {
+        let target = MenuTarget()
+        let selected = [
+            root.appendingPathComponent("first.txt"),
+            root.appendingPathComponent("second.txt"),
+        ]
+        selected.forEach { FileManager.default.createFile(atPath: $0.path, contents: Data()) }
+        let context = MenuInvocationContext(
+            selectedURLs: selected,
+            targetDirectory: root
+        )
+        let builder = FinderMenuBuilder(
+            configuration: .default,
+            target: target,
+            selector: #selector(MenuTarget.perform(_:))
+        )
+        _ = builder.itemsMenu(urls: selected)
+
+        let invocations = MenuInvocation.bind(builder.commands, to: context)
+        XCTAssertEqual(invocations.count, builder.commands.count)
+        XCTAssertTrue(invocations.allSatisfy { $0.context == context })
+        XCTAssertEqual(
+            invocations.map(\.command.action),
+            builder.commands.map(\.action)
+        )
+    }
+
     /// Finder 通过 XPC 在非主线程序列化菜单图标（TIFF），
     /// 图标必须是已渲染好的位图，不能持有主线程隔离的绘制闭包。
     @MainActor
@@ -291,8 +678,10 @@ final class CoreTests: XCTestCase {
     @MainActor
     func testMenuHierarchyAndDangerousDefaults() {
         let target = MenuTarget()
+        var configuration = MenuConfiguration.default
+        configuration.language = .simplifiedChinese
         let builder = FinderMenuBuilder(
-            configuration: .default,
+            configuration: configuration,
             target: target,
             selector: #selector(MenuTarget.perform(_:))
         )
@@ -311,8 +700,58 @@ final class CoreTests: XCTestCase {
     }
 
     @MainActor
+    func testEnglishMenuIncludesLocalizedDynamicTitles() throws {
+        let fakeApp = root.appendingPathComponent("Preview.app", isDirectory: true)
+        try FileManager.default.createDirectory(at: fakeApp, withIntermediateDirectories: true)
+
+        var configuration = MenuConfiguration.default
+        configuration.language = .english
+        configuration.mergeOpenWithApps = false
+        configuration.enablePermanentDelete = true
+        configuration.openWithApps = [
+            MenuConfiguration.defaultOpenWithApps[0],
+            AppShortcut(
+                name: "Preview",
+                appPath: fakeApp.path,
+                bundleIdentifier: "local.SuperRightClickTests.Preview"
+            ),
+        ]
+        let target = MenuTarget()
+        let builder = FinderMenuBuilder(
+            configuration: configuration,
+            target: target,
+            selector: #selector(MenuTarget.perform(_:))
+        )
+        let menu = builder.containerMenu(hasCutItems: false)
+
+        func flattenedTitles(_ menu: NSMenu) -> [String] {
+            menu.items.flatMap { item in
+                [item.title] + (item.submenu.map(flattenedTitles) ?? [])
+            }
+        }
+        let titles = flattenedTitles(menu)
+        XCTAssertTrue(titles.contains("New TXT"))
+        XCTAssertTrue(titles.contains("Open Terminal"))
+        XCTAssertTrue(titles.contains("Open with Preview"))
+        XCTAssertFalse(titles.contains { title in
+            title.unicodeScalars.contains { (0x4E00...0x9FFF).contains($0.value) }
+        })
+
+        let file = root.appendingPathComponent("english-menu.txt")
+        try Data().write(to: file)
+        let itemTitles = flattenedTitles(builder.itemsMenu(urls: [file]))
+        XCTAssertTrue(itemTitles.contains("Copy Path"))
+        XCTAssertTrue(itemTitles.contains("File Actions"))
+        XCTAssertEqual(itemTitles.last, "Delete Permanently…")
+        XCTAssertFalse(itemTitles.contains { title in
+            title.unicodeScalars.contains { (0x4E00...0x9FFF).contains($0.value) }
+        })
+    }
+
+    @MainActor
     func testMenuPersonalizationAndImageContext() throws {
         var configuration = MenuConfiguration.default
+        configuration.language = .simplifiedChinese
         if let index = configuration.actionPreferences.firstIndex(where: {
             $0.action == .copyPath
         }) {
@@ -411,7 +850,186 @@ final class CoreTests: XCTestCase {
     }
 
     @MainActor
-    func testDissolveAndPermanentDeleteAreConfinedToTemporaryDirectory() throws {
+    func testImageConversionSkipsDanglingSymlinkOutput() throws {
+        let source = root.appendingPathComponent("dangling.png")
+        let image = NSImage(size: NSSize(width: 8, height: 8))
+        image.lockFocus()
+        NSColor.systemGreen.setFill()
+        NSRect(x: 0, y: 0, width: 8, height: 8).fill()
+        image.unlockFocus()
+        let bitmap = try XCTUnwrap(NSBitmapImageRep(data: try XCTUnwrap(image.tiffRepresentation)))
+        try XCTUnwrap(bitmap.representation(using: .png, properties: [:])).write(to: source)
+
+        let occupied = root.appendingPathComponent("dangling.jpg")
+        let missingTarget = root.appendingPathComponent("missing-target.jpg")
+        try FileManager.default.createSymbolicLink(at: occupied, withDestinationURL: missingTarget)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: occupied.path))
+
+        let output = try makeCoordinator().convertImage(source, to: .jpg)
+        XCTAssertEqual(output.lastPathComponent, "dangling 2.jpg")
+        XCTAssertEqual(
+            try FileManager.default.destinationOfSymbolicLink(atPath: occupied.path),
+            missingTarget.path
+        )
+        XCTAssertTrue(FileManager.default.fileExists(atPath: output.path))
+        let leftovers = try FileManager.default.contentsOfDirectory(atPath: root.path).filter {
+            $0.hasPrefix(".superrightclick-conversion-")
+        }
+        XCTAssertTrue(leftovers.isEmpty)
+    }
+
+    func testConcurrentImageConversionsCommitUniqueOutputsAtomically() throws {
+        let source = root.appendingPathComponent("parallel.png")
+        let image = NSImage(size: NSSize(width: 16, height: 16))
+        image.lockFocus()
+        NSColor.systemBlue.setFill()
+        NSRect(x: 0, y: 0, width: 16, height: 16).fill()
+        image.unlockFocus()
+        let bitmap = try XCTUnwrap(NSBitmapImageRep(data: try XCTUnwrap(image.tiffRepresentation)))
+        try XCTUnwrap(bitmap.representation(using: .png, properties: [:])).write(to: source)
+
+        let conversionCount = 8
+        let results = ConcurrentImageResults()
+        DispatchQueue.concurrentPerform(iterations: conversionCount) { _ in
+            do {
+                results.record(.success(try FeatureCoordinator.convertImage(
+                    source,
+                    to: .jpg,
+                    quality: 0.85,
+                    backgroundHex: "#FFFFFF",
+                    fileManager: .default
+                )))
+            } catch {
+                results.record(.failure(error))
+            }
+        }
+
+        let snapshot = results.snapshot()
+        XCTAssertEqual(snapshot.errors, [])
+        XCTAssertEqual(snapshot.urls.count, conversionCount)
+        XCTAssertEqual(Set(snapshot.urls.map(\.path)).count, conversionCount)
+        let expectedNames = Set((1...conversionCount).map { index in
+            index == 1 ? "parallel.jpg" : "parallel \(index).jpg"
+        })
+        XCTAssertEqual(Set(snapshot.urls.map(\.lastPathComponent)), expectedNames)
+        for output in snapshot.urls {
+            let source = try XCTUnwrap(CGImageSourceCreateWithURL(output as CFURL, nil))
+            XCTAssertEqual(CGImageSourceGetType(source) as String?, UTType.jpeg.identifier)
+        }
+        let leftovers = try FileManager.default.contentsOfDirectory(atPath: root.path).filter {
+            $0.hasPrefix(".superrightclick-conversion-")
+        }
+        XCTAssertTrue(leftovers.isEmpty)
+    }
+
+    @MainActor
+    func testPermanentDeleteRequiresExplicitApprovalByDefault() async throws {
+        let target = root.appendingPathComponent("approval-required.txt")
+        try Data("content".utf8).write(to: target)
+        let confirmation = PermanentDeleteConfirmationStub(approved: false)
+        var isolationCount = 0
+        let coordinator = makeCoordinator(
+            requiresConfirmation: true,
+            permanentDeleteConfirmation: confirmation.confirm,
+            permanentDeletionWillIsolate: { _ in isolationCount += 1 }
+        )
+
+        await coordinator.permanentlyDelete([target])
+        XCTAssertTrue(FileManager.default.fileExists(atPath: target.path))
+        XCTAssertEqual(confirmation.requestedURLs, [[target]])
+        XCTAssertEqual(isolationCount, 0)
+
+        confirmation.approved = true
+        await coordinator.permanentlyDelete([target])
+        XCTAssertFalse(FileManager.default.fileExists(atPath: target.path))
+        XCTAssertEqual(confirmation.requestedURLs, [[target], [target]])
+        XCTAssertEqual(isolationCount, 1)
+    }
+
+    @MainActor
+    func testPermanentDeleteSkipsBridgeOnlyForStableDisabledPreference() async throws {
+        let target = root.appendingPathComponent("confirmation-disabled.txt")
+        try Data("content".utf8).write(to: target)
+        let safetyStore = SafetyPreferencesStore(
+            directoryURL: root.appendingPathComponent("disabled-safety", isDirectory: true)
+        )
+        _ = try safetyStore.save(confirmBeforePermanentDelete: false)
+        let confirmation = PermanentDeleteConfirmationStub(approved: false)
+        let coordinator = makeCoordinator(
+            requiresConfirmation: true,
+            safetyPreferencesStore: safetyStore,
+            permanentDeleteConfirmation: confirmation.confirm
+        )
+
+        await coordinator.permanentlyDelete([target])
+        XCTAssertFalse(FileManager.default.fileExists(atPath: target.path))
+        XCTAssertTrue(confirmation.requestedURLs.isEmpty)
+    }
+
+    @MainActor
+    func testPermanentDeleteDoesNotDeleteReplacementInsertedBeforeIsolation() async throws {
+        let target = root.appendingPathComponent("race-target.txt")
+        let originalBackup = root.appendingPathComponent("race-original-backup.txt")
+        try Data("original".utf8).write(to: target)
+
+        var swapError: Error?
+        var didSwap = false
+        var presentedErrors: [String] = []
+        let coordinator = makeCoordinator(
+            permanentDeletionWillIsolate: { url in
+                guard !didSwap else { return }
+                didSwap = true
+                do {
+                    try FileManager.default.moveItem(at: url, to: originalBackup)
+                    try Data("replacement".utf8).write(to: url)
+                } catch {
+                    swapError = error
+                }
+            },
+            errorPresentation: { presentedErrors.append($0) }
+        )
+        var configuration = MenuConfiguration.default
+        configuration.language = .english
+        coordinator.updateConfiguration(configuration)
+
+        await coordinator.permanentlyDelete([target])
+
+        XCTAssertNil(swapError)
+        XCTAssertEqual(try Data(contentsOf: target), Data("replacement".utf8))
+        XCTAssertEqual(try Data(contentsOf: originalBackup), Data("original".utf8))
+        XCTAssertEqual(presentedErrors.count, 1)
+        XCTAssertTrue(presentedErrors[0].contains("identity verification"))
+        XCTAssertFalse(try FileManager.default.contentsOfDirectory(atPath: root.path).contains {
+            $0.hasPrefix(".superrightclick-delete-")
+        })
+    }
+
+    @MainActor
+    func testPermanentDeleteHandlesDirectoriesAndSymlinksWithoutFollowingThem() async throws {
+        let outside = root.appendingPathComponent("outside.txt")
+        try Data("keep".utf8).write(to: outside)
+
+        let directory = root.appendingPathComponent("delete-directory", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        try Data("child".utf8).write(to: directory.appendingPathComponent("child.txt"))
+        try FileManager.default.createSymbolicLink(
+            at: directory.appendingPathComponent("outside-link"),
+            withDestinationURL: outside
+        )
+        await makeCoordinator().permanentlyDelete([directory])
+        XCTAssertFalse(FileManager.default.fileExists(atPath: directory.path))
+        XCTAssertEqual(try Data(contentsOf: outside), Data("keep".utf8))
+
+        let link = root.appendingPathComponent("delete-link")
+        try FileManager.default.createSymbolicLink(at: link, withDestinationURL: outside)
+        await makeCoordinator().permanentlyDelete([link])
+        var linkStatus = stat()
+        XCTAssertNotEqual(link.path.withCString { lstat($0, &linkStatus) }, 0)
+        XCTAssertEqual(try Data(contentsOf: outside), Data("keep".utf8))
+    }
+
+    @MainActor
+    func testDissolveAndPermanentDeleteAreConfinedToTemporaryDirectory() async throws {
         let coordinator = makeCoordinator()
         let parent = root.appendingPathComponent("parent", isDirectory: true)
         let folder = parent.appendingPathComponent("folder", isDirectory: true)
@@ -423,7 +1041,7 @@ final class CoreTests: XCTestCase {
         let moved = parent.appendingPathComponent("child.txt")
         XCTAssertTrue(FileManager.default.fileExists(atPath: moved.path))
 
-        coordinator.permanentlyDelete([moved])
+        await coordinator.permanentlyDelete([moved])
         XCTAssertFalse(FileManager.default.fileExists(atPath: moved.path))
     }
 

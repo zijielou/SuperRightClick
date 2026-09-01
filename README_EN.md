@@ -15,7 +15,7 @@
   <p>
     <img src="https://img.shields.io/badge/macOS-15.0%2B-111827?style=flat-square&logo=apple" alt="macOS 15.0+">
     <img src="https://img.shields.io/badge/Apple%20Silicon-M%20Series%20only-111827?style=flat-square&logo=apple" alt="Apple Silicon M series only">
-    <img src="https://img.shields.io/badge/version-0.1.0-2563EB?style=flat-square" alt="Version 0.1.0">
+    <img src="https://img.shields.io/badge/version-0.2.0-2563EB?style=flat-square" alt="Version 0.1.0">
   </p>
 </div>
 
@@ -65,7 +65,7 @@ SuperRightClick enhances the macOS Finder context menu through a Finder Sync ext
 - All file operations run locally
 - The current implementation contains no networking, telemetry, or file-upload logic
 - Bulk visibility changes, permission changes, folder dissolution, and permanent deletion are disabled by default
-- Permanent deletion bypasses Trash and always requires confirmation
+- Permanent deletion bypasses Trash and is confirmed in the foreground app by default; per-operation confirmation can be explicitly disabled under Advanced
 - No per-operation log is continuously appended; only required preferences and a small amount of state are stored
 
 ## Requirements
@@ -128,7 +128,7 @@ Grant Accessibility permission on SuperRightClick's Status page. macOS may requi
 
 ### Is permanent deletion safe?
 
-It is disabled by default. When enabled, files are deleted directly without being moved to Trash. Keep appropriate backups and read the confirmation carefully.
+It is disabled by default. When enabled, files are deleted directly without being moved to Trash, with confirmation shown by the foreground app by default. Per-operation confirmation can be disabled under Advanced; once disabled, choosing permanent deletion acts immediately and cannot be undone. Keep appropriate backups.
 
 ### Does the app continuously accumulate operation logs?
 

@@ -22,6 +22,8 @@
 		A00000000000000000000072 /* FeatureServices.swift in Sources */ = {isa = PBXBuildFile; fileRef = A00000000000000000000062 /* FeatureServices.swift */; };
 		A00000000000000000000073 /* XCTest.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = A00000000000000000000076 /* XCTest.framework */; };
 		A0000000000000000000007E /* MenuBuilder.swift in Sources */ = {isa = PBXBuildFile; fileRef = A00000000000000000000063 /* MenuBuilder.swift */; };
+		A00000000000000000000088 /* InfoPlist.strings in Resources */ = {isa = PBXBuildFile; fileRef = A00000000000000000000080 /* InfoPlist.strings */; };
+		A00000000000000000000089 /* InfoPlist.strings in Resources */ = {isa = PBXBuildFile; fileRef = A00000000000000000000084 /* InfoPlist.strings */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -64,7 +66,36 @@
 		A00000000000000000000074 /* CoreTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CoreTests.swift; sourceTree = "<group>"; };
 		A00000000000000000000075 /* SuperRightClickTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = SuperRightClickTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 		A00000000000000000000076 /* XCTest.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = XCTest.framework; path = Developer/Library/Frameworks/XCTest.framework; sourceTree = DEVELOPER_DIR; };
+		A00000000000000000000081 /* en */ = {isa = PBXFileReference; lastKnownFileType = text.plist.strings; name = en; path = en.lproj/InfoPlist.strings; sourceTree = "<group>"; };
+		A00000000000000000000082 /* zh-Hans */ = {isa = PBXFileReference; lastKnownFileType = text.plist.strings; name = "zh-Hans"; path = zh-Hans.lproj/InfoPlist.strings; sourceTree = "<group>"; };
+		A00000000000000000000083 /* zh-Hant */ = {isa = PBXFileReference; lastKnownFileType = text.plist.strings; name = "zh-Hant"; path = zh-Hant.lproj/InfoPlist.strings; sourceTree = "<group>"; };
+		A00000000000000000000085 /* en */ = {isa = PBXFileReference; lastKnownFileType = text.plist.strings; name = en; path = en.lproj/InfoPlist.strings; sourceTree = "<group>"; };
+		A00000000000000000000086 /* zh-Hans */ = {isa = PBXFileReference; lastKnownFileType = text.plist.strings; name = "zh-Hans"; path = zh-Hans.lproj/InfoPlist.strings; sourceTree = "<group>"; };
+		A00000000000000000000087 /* zh-Hant */ = {isa = PBXFileReference; lastKnownFileType = text.plist.strings; name = "zh-Hant"; path = zh-Hant.lproj/InfoPlist.strings; sourceTree = "<group>"; };
 /* End PBXFileReference section */
+
+/* Begin PBXVariantGroup section */
+		A00000000000000000000080 /* InfoPlist.strings */ = {
+			isa = PBXVariantGroup;
+			children = (
+				A00000000000000000000081 /* en */,
+				A00000000000000000000082 /* zh-Hans */,
+				A00000000000000000000083 /* zh-Hant */,
+			);
+			name = InfoPlist.strings;
+			sourceTree = "<group>";
+		};
+		A00000000000000000000084 /* InfoPlist.strings */ = {
+			isa = PBXVariantGroup;
+			children = (
+				A00000000000000000000085 /* en */,
+				A00000000000000000000086 /* zh-Hans */,
+				A00000000000000000000087 /* zh-Hant */,
+			);
+			name = InfoPlist.strings;
+			sourceTree = "<group>";
+		};
+/* End PBXVariantGroup section */
 
 /* Begin PBXFrameworksBuildPhase section */
 		A00000000000000000000031 /* Frameworks */ = {
@@ -131,6 +162,7 @@
 				A00000000000000000000010 /* SuperRightClickApp.swift */,
 				A00000000000000000000011 /* ContentView.swift */,
 				A00000000000000000000012 /* Info.plist */,
+				A00000000000000000000080 /* InfoPlist.strings */,
 			);
 			path = App;
 			sourceTree = "<group>";
@@ -142,6 +174,7 @@
 				A00000000000000000000062 /* FeatureServices.swift */,
 				A00000000000000000000063 /* MenuBuilder.swift */,
 				A00000000000000000000014 /* Info.plist */,
+				A00000000000000000000084 /* InfoPlist.strings */,
 				A00000000000000000000015 /* FinderExtension.entitlements */,
 			);
 			path = FinderExtension;
@@ -246,6 +279,8 @@
 			hasScannedForEncodings = 0;
 			knownRegions = (
 				en,
+				"zh-Hans",
+				"zh-Hant",
 				Base,
 			);
 			mainGroup = A00000000000000000000002;
@@ -268,6 +303,7 @@
 			buildActionMask = 2147483647;
 			files = (
 				A00000000000000000000028 /* AppIcon.icns in Resources */,
+				A00000000000000000000088 /* InfoPlist.strings in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -275,6 +311,7 @@
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				A00000000000000000000089 /* InfoPlist.strings in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -435,7 +472,7 @@
 					"$(inherited)",
 					"@executable_path/../Frameworks",
 				);
-				MARKETING_VERSION = 0.1.0;
+				MARKETING_VERSION = 0.2.0;
 				PRODUCT_BUNDLE_IDENTIFIER = local.SuperRightClick;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SWIFT_EMIT_LOC_STRINGS = YES;
@@ -458,7 +495,7 @@
 					"$(inherited)",
 					"@executable_path/../Frameworks",
 				);
-				MARKETING_VERSION = 0.1.0;
+				MARKETING_VERSION = 0.2.0;
 				PRODUCT_BUNDLE_IDENTIFIER = local.SuperRightClick;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SWIFT_EMIT_LOC_STRINGS = YES;
@@ -483,7 +520,7 @@
 					"@executable_path/../../../../Frameworks",
 					"@executable_path/../Frameworks",
 				);
-				MARKETING_VERSION = 0.1.0;
+				MARKETING_VERSION = 0.2.0;
 				PRODUCT_BUNDLE_IDENTIFIER = local.SuperRightClick.FinderExtension;
 				PRODUCT_NAME = SuperRightClickFinder;
 				SKIP_INSTALL = YES;
@@ -509,7 +546,7 @@
 					"@executable_path/../../../../Frameworks",
 					"@executable_path/../Frameworks",
 				);
-				MARKETING_VERSION = 0.1.0;
+				MARKETING_VERSION = 0.2.0;
 				PRODUCT_BUNDLE_IDENTIFIER = local.SuperRightClick.FinderExtension;
 				PRODUCT_NAME = SuperRightClickFinder;
 				SKIP_INSTALL = YES;

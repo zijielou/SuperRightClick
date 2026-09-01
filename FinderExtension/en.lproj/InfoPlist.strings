@@ -1,0 +1,3 @@
+"CFBundleDisplayName" = "SuperRightClick Finder Extension";
+"CFBundleName" = "SuperRightClick Finder Extension";
+"NSAppleEventsUsageDescription" = "Allows the selected folder to be opened in a new Finder window or tab.";

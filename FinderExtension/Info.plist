@@ -23,7 +23,7 @@
     <key>LSMinimumSystemVersion</key>
     <string>$(MACOSX_DEPLOYMENT_TARGET)</string>
     <key>NSAppleEventsUsageDescription</key>
-    <string>用于在 Finder 新窗口或新标签页中打开用户选择的文件夹。</string>
+    <string>Allows the selected folder to be opened in a new Finder window or tab.</string>
     <key>NSExtension</key>
     <dict>
         <key>NSExtensionAttributes</key>

@@ -17,10 +17,10 @@ private final class UnsafeMenuItemBox: @unchecked Sendable {
 final class FinderSync: FIFinderSync, @unchecked Sendable {
     @MainActor private lazy var controller = FIFinderSyncController.default()
     @MainActor private lazy var coordinator = FeatureCoordinator()
-    @MainActor private var configurationObservers: [NSObjectProtocol] = []
+    private let observers = NotificationObservationBag()
     /// 菜单项使用跨菜单唯一 tag，保留近期映射，避免 Finder 在重新构建菜单后
-    /// 点击旧菜单时按新数组下标误触其他动作。
-    @MainActor private var menuCommands: [Int: MenuCommand] = [:]
+    /// 点击旧菜单时按新数组下标误触其他动作。每个映射同时持有构建时上下文。
+    @MainActor private var menuCommands: [Int: MenuInvocation] = [:]
     @MainActor private var nextMenuTag = 1
 
     override init() {
@@ -34,11 +34,11 @@ final class FinderSync: FIFinderSync, @unchecked Sendable {
     private func configure() {
         let hadConfiguration = ConfigurationStore.hasStoredConfiguration()
         controller.directoryURLs = [UserPaths.homeDirectory]
-        configurationObservers.append(ConfigurationStore.observeUpdates { [weak self] value in
+        observers.addDistributed(ConfigurationStore.observeUpdates { [weak self] value in
             self?.coordinator.updateConfiguration(value)
         })
-        configurationObservers.append(ConfigurationStore.observeExtensionRequests())
-        configurationObservers.append(
+        observers.addDistributed(ConfigurationStore.observeExtensionRequests())
+        observers.addDistributed(
             ConfigurationStore.observeTemplateImportRequests { [weak self] url in
                 self?.coordinator.importTemplate(from: url)
             }
@@ -82,6 +82,10 @@ final class FinderSync: FIFinderSync, @unchecked Sendable {
             || (targetedURL.map(configuration.isExcluded) ?? false) {
             return nil
         }
+        let invocationContext = MenuInvocationContext(
+            selectedURLs: contextURLs,
+            targetDirectory: targetDirectory(for: contextURLs, targetedURL: targetedURL)
+        )
         let firstTag = nextMenuTag
         let builder = FinderMenuBuilder(
             configuration: configuration,
@@ -103,8 +107,9 @@ final class FinderSync: FIFinderSync, @unchecked Sendable {
         @unknown default:
             menu = nil
         }
-        for (offset, command) in builder.commands.enumerated() {
-            menuCommands[firstTag + offset] = command
+        let invocations = MenuInvocation.bind(builder.commands, to: invocationContext)
+        for (offset, invocation) in invocations.enumerated() {
+            menuCommands[firstTag + offset] = invocation
         }
         nextMenuTag = firstTag + builder.commands.count
         if menuCommands.count > 4_096 {
@@ -124,9 +129,10 @@ final class FinderSync: FIFinderSync, @unchecked Sendable {
     @MainActor
     private func performMenuActionOnMain(_ sender: NSMenuItem) {
         let tag = sender.tag
-        guard let command = menuCommands[tag] else { return }
-        let urls = selectedURLs()
-        let currentDirectory = targetDirectory(for: urls)
+        guard let invocation = menuCommands[tag] else { return }
+        let command = invocation.command
+        let urls = invocation.context.selectedURLs
+        let currentDirectory = invocation.context.targetDirectory
 
         switch command.action {
         case .createTemplate:
@@ -202,7 +208,10 @@ final class FinderSync: FIFinderSync, @unchecked Sendable {
                 coordinator.openInFinder(location, newTab: true)
             }
         case .permanentDelete:
-            coordinator.permanentlyDelete(urls)
+            let targets = urls
+            Task { @MainActor [weak self] in
+                await self?.coordinator.permanentlyDelete(targets)
+            }
         case .convertWebP:
             coordinator.convertImages(urls, to: .webP)
         case .convertHEIC:
@@ -230,16 +239,13 @@ final class FinderSync: FIFinderSync, @unchecked Sendable {
     }
 
     @MainActor
-    private func targetDirectory(for selected: [URL]) -> URL? {
-        if let target = controller.targetedURL() {
-            return isDirectory(target) ? target : target.deletingLastPathComponent()
+    private func targetDirectory(for selected: [URL], targetedURL: URL?) -> URL? {
+        if let targetedURL {
+            return isDirectory(targetedURL)
+                ? targetedURL
+                : targetedURL.deletingLastPathComponent()
         }
-        if let first = selected.first {
-            return first.hasDirectoryPath
-                ? first.deletingLastPathComponent()
-                : first.deletingLastPathComponent()
-        }
-        return nil
+        return selected.first?.deletingLastPathComponent()
     }
 
     @MainActor

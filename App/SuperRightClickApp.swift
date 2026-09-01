@@ -2,24 +2,53 @@ import AppKit
 import FinderSync
 import SwiftUI
 
+private final class WeakWindowBox: @unchecked Sendable {
+    weak var window: NSWindow?
+
+    init(_ window: NSWindow) {
+        self.window = window
+    }
+}
+
 @MainActor
 final class AppLifecycleModel: NSObject, ObservableObject {
-    private var observers: [NSObjectProtocol] = []
+    private let observers = NotificationObservationBag()
     private var statusItem: NSStatusItem?
     private var fallbackSettingsWindow: NSWindow?
     private var renameTask: Task<Void, Never>?
+    private var destructiveConfirmationTask: Task<Void, Never>?
+    private var pendingDestructiveConfirmations: [DestructiveConfirmationRequest] = []
+    private var handledDestructiveConfirmationIDs: [UUID: Date] = [:]
+    private var configuration: MenuConfiguration
 
     override init() {
+        let initialConfiguration = ConfigurationStore.load()
+        configuration = initialConfiguration
         super.init()
-        updateStatusItem(isVisible: ConfigurationStore.load().showMenuBarIcon)
-        observers.append(ConfigurationStore.observeUpdates { [weak self] configuration in
-            self?.updateStatusItem(isVisible: configuration.showMenuBarIcon)
+        updateStatusItem(configuration: initialConfiguration)
+        observers.addLocal(ConfigurationStore.observeLocalUpdates { [weak self] value in
+            guard let self else { return }
+            self.configuration = value
+            self.updateStatusItem(configuration: value)
         })
-        observers.append(ConfigurationStore.observeRenameRequests { [weak self] url in
+        // 进程级 owner 负责接收并持久化扩展配置，避免每个设置窗口
+        // 都注册一份跨进程观察者和配置请求响应者。
+        observers.addDistributed(ConfigurationStore.observeUpdates { _ in })
+        observers.addDistributed(ConfigurationStore.observeAppRequests())
+        observers.addDistributed(ConfigurationStore.observeRenameRequests { [weak self] url in
             self?.renameInFinder(url)
+        })
+        observers.addDistributed(DestructiveConfirmationBridge.observeRequests { [weak self] url in
+            self?.enqueueDestructiveConfirmation(at: url)
         })
         if let launchURL = Self.renameURLFromLaunchArguments() {
             renameInFinder(launchURL)
+        }
+        if let requestURL = Self.destructiveConfirmationURLFromLaunchArguments() {
+            Task { @MainActor [weak self] in
+                await Task.yield()
+                self?.enqueueDestructiveConfirmation(at: requestURL)
+            }
         }
     }
 
@@ -31,39 +60,169 @@ final class AppLifecycleModel: NSObject, ObservableObject {
         return URL(fileURLWithPath: arguments[marker + 1]).standardizedFileURL
     }
 
-    private func updateStatusItem(isVisible: Bool) {
-        if !isVisible {
+    private static func destructiveConfirmationURLFromLaunchArguments(
+        _ arguments: [String] = ProcessInfo.processInfo.arguments
+    ) -> URL? {
+        guard let marker = arguments.firstIndex(of: DestructiveConfirmationBridge.launchArgument),
+              arguments.indices.contains(marker + 1) else { return nil }
+        return URL(fileURLWithPath: arguments[marker + 1]).standardizedFileURL
+    }
+
+    private func enqueueDestructiveConfirmation(at requestURL: URL) {
+        let request: DestructiveConfirmationRequest
+        do {
+            request = try DestructiveConfirmationBridge.readRequest(at: requestURL)
+        } catch {
+            return
+        }
+
+        let expiry = Date().addingTimeInterval(-300)
+        handledDestructiveConfirmationIDs = handledDestructiveConfirmationIDs.filter {
+            $0.value >= expiry
+        }
+        guard handledDestructiveConfirmationIDs[request.id] == nil else { return }
+
+        handledDestructiveConfirmationIDs[request.id] = Date()
+        pendingDestructiveConfirmations.append(request)
+        processNextDestructiveConfirmation()
+    }
+
+    private func processNextDestructiveConfirmation() {
+        guard destructiveConfirmationTask == nil,
+              !pendingDestructiveConfirmations.isEmpty else { return }
+        let request = pendingDestructiveConfirmations.removeFirst()
+        destructiveConfirmationTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            let approved = await self.presentDestructiveConfirmation(request)
+            await self.sendDestructiveConfirmationResponse(approved, for: request)
+            self.destructiveConfirmationTask = nil
+            self.processNextDestructiveConfirmation()
+        }
+    }
+
+    private func sendDestructiveConfirmationResponse(
+        _ approved: Bool,
+        for request: DestructiveConfirmationRequest
+    ) async {
+        let response = DestructiveConfirmationResponse(
+            requestID: request.id,
+            requestDigest: request.authenticationDigest,
+            approved: approved
+        )
+        await Task.detached(priority: .userInitiated) {
+            try? DestructiveConfirmationBridge.sendResponse(
+                response,
+                toSocketPath: request.replySocketPath
+            )
+        }.value
+    }
+
+    private func presentDestructiveConfirmation(
+        _ request: DestructiveConfirmationRequest
+    ) async -> Bool {
+        let maximumAge = DestructiveConfirmationBridge.responseTimeoutSeconds
+        let remaining = DestructiveConfirmationBridge.remainingResponseLifetime(
+            for: request
+        )
+        guard remaining > 0 else { return false }
+
+        NSApp.activate(ignoringOtherApps: true)
+        let clock = ContinuousClock()
+        let activationDeadline = clock.now.advanced(by: .seconds(3))
+        while !NSApp.isActive, clock.now < activationDeadline {
+            NSApp.activate(ignoringOtherApps: true)
+            try? await Task.sleep(for: .milliseconds(25))
+        }
+        guard NSApp.isActive else { return false }
+
+        let language = configuration.language
+        let alert = NSAlert()
+        alert.alertStyle = .critical
+        alert.messageText = Localizer.text("永久删除", language: language)
+        alert.informativeText = request.paths.count == 1
+            ? Localizer.text(
+                "将永久删除 1 个项目，此操作不经过废纸篓且无法撤销。",
+                language: language
+            )
+            : Localizer.format(
+                "将永久删除 %@ 个项目，此操作不经过废纸篓且无法撤销。",
+                language: language,
+                String(request.paths.count)
+            )
+        alert.addButton(withTitle: Localizer.text("永久删除", language: language))
+        alert.addButton(withTitle: Localizer.text("取消", language: language))
+
+        var confirmationField: NSTextField?
+        if request.confirmationMode == .typeDelete {
+            let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 280, height: 24))
+            field.placeholderString = Localizer.text("请输入 DELETE", language: language)
+            alert.accessoryView = field
+            confirmationField = field
+        }
+
+        let window = alert.window
+        window.collectionBehavior.formUnion([.moveToActiveSpace, .fullScreenAuxiliary])
+        window.makeKeyAndOrderFront(nil)
+        let windowBox = WeakWindowBox(window)
+        let timeout = Timer(timeInterval: remaining, repeats: false) { _ in
+            Task { @MainActor in
+                guard let window = windowBox.window else { return }
+                if NSApp.modalWindow === window { NSApp.abortModal() }
+                window.orderOut(nil)
+            }
+        }
+        RunLoop.main.add(timeout, forMode: .common)
+        defer { timeout.invalidate() }
+
+        let response = alert.runModal()
+        guard Date().timeIntervalSince(request.createdAt) < maximumAge,
+              response == .alertFirstButtonReturn else { return false }
+        return confirmationField?.stringValue == "DELETE" || confirmationField == nil
+    }
+
+    private func updateStatusItem(configuration: MenuConfiguration) {
+        guard configuration.showMenuBarIcon else {
             if let statusItem { NSStatusBar.system.removeStatusItem(statusItem) }
             statusItem = nil
             return
         }
-        guard statusItem == nil else { return }
-        let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
-        item.button?.image = OriginalMenuIcon.statusBarImage()
-        item.button?.image?.size = NSSize(width: 18, height: 18)
-        item.button?.imageScaling = .scaleProportionallyDown
-        item.button?.toolTip = "SuperRightClick"
 
+        let item: NSStatusItem
+        if let statusItem {
+            item = statusItem
+        } else {
+            item = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
+            item.button?.image = OriginalMenuIcon.statusBarImage()
+            item.button?.image?.size = NSSize(width: 18, height: 18)
+            item.button?.imageScaling = .scaleProportionallyDown
+            item.button?.toolTip = "SuperRightClick"
+            statusItem = item
+        }
+
+        let language = configuration.language
         let menu = NSMenu()
         let openSettings = NSMenuItem(
-            title: "打开设置",
+            title: Localizer.text("打开设置", language: language),
             action: #selector(showSettings),
             keyEquivalent: ""
         )
         openSettings.target = self
         menu.addItem(openSettings)
         let extensionSettings = NSMenuItem(
-            title: "打开 Finder 扩展设置",
+            title: Localizer.text("打开 Finder 扩展设置", language: language),
             action: #selector(showFinderExtensionSettings),
             keyEquivalent: ""
         )
         extensionSettings.target = self
         menu.addItem(extensionSettings)
-        let quit = NSMenuItem(title: "退出", action: #selector(quitApplication), keyEquivalent: "")
+        let quit = NSMenuItem(
+            title: Localizer.text("退出", language: language),
+            action: #selector(quitApplication),
+            keyEquivalent: ""
+        )
         quit.target = self
         menu.addItem(quit)
         item.menu = menu
-        statusItem = item
     }
 
     @objc private func showSettings() {

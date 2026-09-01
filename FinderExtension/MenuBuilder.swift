@@ -12,6 +12,25 @@ struct MenuCommand {
     }
 }
 
+/// 菜单构建时捕获的 Finder 上下文。点击发生后不再重新查询 Finder，
+/// 避免菜单显示对象与最终执行对象不一致。
+struct MenuInvocationContext: Equatable {
+    let selectedURLs: [URL]
+    let targetDirectory: URL?
+}
+
+struct MenuInvocation {
+    let command: MenuCommand
+    let context: MenuInvocationContext
+
+    static func bind(
+        _ commands: [MenuCommand],
+        to context: MenuInvocationContext
+    ) -> [MenuInvocation] {
+        commands.map { MenuInvocation(command: $0, context: context) }
+    }
+}
+
 @MainActor
 final class FinderMenuBuilder {
     private let configuration: MenuConfiguration
@@ -133,7 +152,7 @@ final class FinderMenuBuilder {
         for template in enabled where template.showInMainMenu {
             let templateItem = item(
                 .createTemplate,
-                title: "新建 \(template.name)",
+                title: formatted("新建 %@", template.name),
                 payload: template.id.uuidString
             )
             templateItem.image = templateImage(for: template)
@@ -160,7 +179,10 @@ final class FinderMenuBuilder {
     private func addTerminalItems(to menu: NSMenu) {
         for entry in availableApps where entry.shortcut.isTerminalApp {
             let app = entry.shortcut
-            let title = app.name == "终端" ? "打开终端" : "用\(app.name)打开"
+            let displayName = app.displayName(language: configuration.language)
+            let title = app.usesDefaultTerminalName
+                ? localized("打开终端")
+                : formatted("用 %@ 打开", displayName)
             let menuItem = item(.openWithApp, title: title, payload: app.id.uuidString)
             menuItem.image = applicationImage(at: entry.url)
             menu.addItem(menuItem)
@@ -174,7 +196,11 @@ final class FinderMenuBuilder {
             let submenu = NSMenu(title: configuration.title(for: .openWithApp))
             for entry in apps {
                 let app = entry.shortcut
-                let menuItem = item(.openWithApp, title: app.name, payload: app.id.uuidString)
+                let menuItem = item(
+                    .openWithApp,
+                    title: app.displayName(language: configuration.language),
+                    payload: app.id.uuidString
+                )
                 menuItem.image = applicationImage(at: entry.url)
                 submenu.addItem(menuItem)
             }
@@ -188,7 +214,10 @@ final class FinderMenuBuilder {
                 let app = entry.shortcut
                 let menuItem = item(
                     .openWithApp,
-                    title: localized("用 %@ 打开").replacingOccurrences(of: "%@", with: app.name),
+                    title: formatted(
+                        "用 %@ 打开",
+                        app.displayName(language: configuration.language)
+                    ),
                     payload: app.id.uuidString
                 )
                 menuItem.image = applicationImage(at: entry.url)
@@ -221,7 +250,7 @@ final class FinderMenuBuilder {
             directory.isEnabled && FileManager.default.fileExists(atPath: directory.resolvedURL.path) {
             submenu.addItem(item(
                 .openCommonDirectory,
-                title: directory.name,
+                title: directory.displayName(language: configuration.language),
                 payload: directory.id.uuidString
             ))
         }
@@ -241,7 +270,7 @@ final class FinderMenuBuilder {
             directory.isEnabled && FileManager.default.fileExists(atPath: directory.resolvedURL.path) {
             submenu.addItem(item(
                 action,
-                title: directory.name,
+                title: directory.displayName(language: configuration.language),
                 payload: directory.id.uuidString
             ))
         }
@@ -329,6 +358,10 @@ final class FinderMenuBuilder {
 
     private func localized(_ value: String) -> String {
         Localizer.text(value, language: configuration.language)
+    }
+
+    private func formatted(_ value: String, _ arguments: CVarArg...) -> String {
+        Localizer.format(value, language: configuration.language, arguments: arguments)
     }
 
     private func finish(_ menu: NSMenu) {

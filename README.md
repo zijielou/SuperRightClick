@@ -15,7 +15,7 @@
   <p>
     <img src="https://img.shields.io/badge/macOS-15.0%2B-111827?style=flat-square&logo=apple" alt="macOS 15.0+">
     <img src="https://img.shields.io/badge/Apple%20Silicon-M%20Series%20only-111827?style=flat-square&logo=apple" alt="仅支持 Apple Silicon M 系列">
-    <img src="https://img.shields.io/badge/version-0.1.0-2563EB?style=flat-square" alt="Version 0.1.0">
+    <img src="https://img.shields.io/badge/version-0.2.0-2563EB?style=flat-square" alt="Version 0.1.0">
   </p>
 </div>
 
@@ -65,7 +65,7 @@ SuperRightClick 通过 Finder Sync 扩展增强 macOS Finder 的右键菜单，�
 - 文件操作均在本机完成
 - 当前实现不包含联网、遥测或文件上传逻辑
 - 批量隐藏、修改权限、解散文件夹和永久删除默认关闭
-- 永久删除不经过废纸篓，每次执行前都会要求确认
+- 永久删除不经过废纸篓，默认由主应用前台确认；可在“高级”中明确关闭每次确认
 - 不会持续写入按操作累积的日志文件，仅保存必要配置和少量状态信息
 
 ## 系统要求
@@ -128,7 +128,7 @@ killall Finder
 
 ### 永久删除安全吗？
 
-该功能默认关闭。启用后，文件将被直接删除而不进入废纸篓，请确认已有必要备份并仔细阅读确认提示。
+该功能默认关闭。启用后，文件将被直接删除而不进入废纸篓；默认会由主应用前台确认。可在“高级”中关闭每次确认，关闭后点击永久删除菜单将立即执行且无法撤销，请确保已有必要备份。
 
 ### 软件会不断产生操作日志吗？
 
