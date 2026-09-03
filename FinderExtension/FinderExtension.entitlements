@@ -4,6 +4,8 @@
 <dict>
     <key>com.apple.security.app-sandbox</key>
     <true/>
+    <key>com.apple.security.network.server</key>
+    <true/>
     <key>com.apple.security.files.user-selected.read-write</key>
     <true/>
     <!-- 非 App Store 分发：放开家目录与外接卷的读写，否则粘贴/新建等写入

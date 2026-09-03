@@ -15,7 +15,7 @@
   <p>
     <img src="https://img.shields.io/badge/macOS-15.0%2B-111827?style=flat-square&logo=apple" alt="macOS 15.0+">
     <img src="https://img.shields.io/badge/Apple%20Silicon-M%20Series%20only-111827?style=flat-square&logo=apple" alt="Apple Silicon M series only">
-    <img src="https://img.shields.io/badge/version-0.2.0-2563EB?style=flat-square" alt="Version 0.1.0">
+    <img src="https://img.shields.io/badge/version-0.2.0-2563EB?style=flat-square" alt="Version 0.2.0">
   </p>
 </div>
 
@@ -94,14 +94,8 @@ No Xcode installation or local build is required. Download the DMG and install t
 5. To enter rename mode automatically after creating a file, select **Request Accessibility Access** and grant permission.
 6. Return to Finder and right-click a file, folder, or empty area.
 
-If the menu does not appear immediately after enabling the extension, run this command in Terminal:
-
-```bash
-killall Finder
-```
-
 > [!NOTE]
-> The current DMG has not been notarized by Apple, so macOS may report that the developer cannot be verified. Download it only from this project's GitHub Releases. After confirming the source, Control-click `SuperRightClick.app` in Finder and select **Open**. If it is still blocked, allow it under **System Settings → Privacy & Security**.
+> The current DMG has not been notarized by Apple, so macOS will report that the developer cannot be verified. To install, go to **System Settings → Privacy & Security** and click **Open Anyway**. Download the DMG only from this project's GitHub Releases and install it after confirming the source is trustworthy.
 
 ## Configuration
 

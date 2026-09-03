@@ -127,13 +127,10 @@ final class AppLifecycleModel: NSObject, ObservableObject {
         guard remaining > 0 else { return false }
 
         NSApp.activate(ignoringOtherApps: true)
-        let clock = ContinuousClock()
-        let activationDeadline = clock.now.advanced(by: .seconds(3))
-        while !NSApp.isActive, clock.now < activationDeadline {
-            NSApp.activate(ignoringOtherApps: true)
-            try? await Task.sleep(for: .milliseconds(25))
+        if !NSApp.isActive {
+            try? await Task.sleep(for: .milliseconds(80))
+            if !NSApp.isActive { NSApp.activate(ignoringOtherApps: true) }
         }
-        guard NSApp.isActive else { return false }
 
         let language = configuration.language
         let alert = NSAlert()
@@ -161,8 +158,12 @@ final class AppLifecycleModel: NSObject, ObservableObject {
         }
 
         let window = alert.window
+        window.level = .modalPanel
         window.collectionBehavior.formUnion([.moveToActiveSpace, .fullScreenAuxiliary])
         window.makeKeyAndOrderFront(nil)
+        if !NSApp.isActive {
+            NSApp.activate(ignoringOtherApps: true)
+        }
         let windowBox = WeakWindowBox(window)
         let timeout = Timer(timeInterval: remaining, repeats: false) { _ in
             Task { @MainActor in

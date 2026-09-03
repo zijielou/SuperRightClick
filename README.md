@@ -26,8 +26,7 @@ SuperRightClick 通过 Finder Sync 扩展增强 macOS Finder 的右键菜单，�
 - 创建后可自动进入 Finder 重命名状态
 - 可选择创建后自动打开文件或播放提示音
 
-> 创建后自动重命名需要为 SuperRightClick 授予“辅助功能”权限。
-
+> 创建后自动重命名需要为 SuperRightClick 授予"辅助功能"权限。
 
 
 ### 文件与文件夹操作
@@ -57,7 +56,7 @@ SuperRightClick 通过 Finder Sync 扩展增强 macOS Finder 的右键菜单，�
 - 单独启用或停用每项菜单功能
 - 修改菜单名称并通过拖动调整顺序
 - 显示、隐藏或替换单项菜单图标
-- 将文件操作、“用 App 打开”和图片转换合并为二级菜单
+- 将文件操作、"用 App 打开"和图片转换合并为二级菜单
 - 可显示或隐藏菜单栏图标
 - 可排除不希望显示增强菜单的目录
 
@@ -68,7 +67,7 @@ SuperRightClick 通过 Finder Sync 扩展增强 macOS Finder 的右键菜单，�
 - 文件操作均在本机完成
 - 当前实现不包含联网、遥测或文件上传逻辑
 - 批量隐藏、修改权限、解散文件夹和永久删除默认关闭
-- 永久删除不经过废纸篓，默认由主应用前台确认；可在“高级”中明确关闭每次确认
+- 永久删除不经过废纸篓，默认由主应用前台确认；可在"高级"中明确关闭每次确认
 - 不会持续写入按操作累积的日志文件，仅保存必要配置和少量状态信息
 
 
@@ -78,7 +77,7 @@ SuperRightClick 通过 Finder Sync 扩展增强 macOS Finder 的右键菜单，�
 - **处理器：Apple Silicon（M 系列，arm64）**
 - macOS 15.0 或更高版本
 - Finder 扩展权限
-- “创建后自动重命名”需要辅助功能权限
+- "创建后自动重命名"需要辅助功能权限
 - 操作受保护位置时，可能需要完全磁盘访问权限
 
 > [!IMPORTANT]
@@ -93,20 +92,14 @@ SuperRightClick 通过 Finder Sync 扩展增强 macOS Finder 的右键菜单，�
 ![前往 GitHub Releases 下载最新 DMG](https://img.shields.io/badge/前往_GitHub_Releases-下载最新_DMG-2563EB?style=for-the-badge&logo=github)
 
 1. 打开上方下载页面，在最新版本的 **Assets** 中下载 `.dmg` 文件。
-2. 打开 DMG，将 `SuperRightClick.app` 拖入“应用程序”文件夹。
+2. 打开 DMG，将 `SuperRightClick.app` 拖入"应用程序"文件夹。
 3. 启动 SuperRightClick。
-4. 在“状态”页面点击“打开 Finder 扩展设置”，启用 **SuperRightClick Finder Extension**。
-5. 如需创建文件后自动进入重命名状态，请点击“请求辅助功能授权”并完成授权。
+4. 在"状态"页面点击"打开 Finder 扩展设置"，启用 **SuperRightClick Finder Extension**。
+5. 如需创建文件后自动进入重命名状态，请点击"请求辅助功能授权"并完成授权。
 6. 回到 Finder，在文件、文件夹或目录空白处点击右键即可使用。
 
-如果启用扩展后菜单没有立即出现，可在“终端”执行：
-
-```bash
-killall Finder
-```
-
 > [!NOTE]
-> 当前 DMG 尚未经过 Apple 公证，macOS 可能提示无法验证开发者。请仅从本项目的 GitHub Releases 下载；确认来源可信后，可在 Finder 中按住 Control 点击 `SuperRightClick.app`，选择“打开”。如果仍被拦截，请前往“系统设置 → 隐私与安全性”确认打开。
+> 当前 DMG 尚未经过 Apple 公证，macOS 会提示无法验证开发者。安装时需要前往"系统设置 → 隐私与安全性"，点击"仍要打开"才能正常启动。请仅从本项目的 GitHub Releases 下载，确认来源可信后再安装。
 
 
 
@@ -137,11 +130,11 @@ killall Finder
 
 ### 新建文件后没有进入重命名状态
 
-在 SuperRightClick 的“状态”页面授予辅助功能权限。更新或重新安装应用后，macOS 可能要求重新授权。
+在 SuperRightClick 的"状态"页面授予辅助功能权限。更新或重新安装应用后，macOS 可能要求重新授权。
 
 ### 永久删除安全吗？
 
-该功能默认关闭。启用后，文件将被直接删除而不进入废纸篓；默认会由主应用前台确认。可在“高级”中关闭每次确认，关闭后点击永久删除菜单将立即执行且无法撤销，请确保已有必要备份。
+该功能默认关闭。启用后，文件将被直接删除而不进入废纸篓；默认会由主应用前台确认。可在"高级"中关闭每次确认，关闭后点击永久删除菜单将立即执行且无法撤销，请确保已有必要备份。
 
 ### 软件会不断产生操作日志吗？
 

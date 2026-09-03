@@ -61,10 +61,14 @@ final class AuthenticatedDestructiveConfirmationServer: @unchecked Sendable {
     private var descriptor: Int32 = -1
 
     static func makeSocketPath() -> String {
-        let token = UUID().uuidString.replacingOccurrences(of: "-", with: "").prefix(16)
-        return FileManager.default.temporaryDirectory
-            .appendingPathComponent(".src-\(token)")
-            .path
+        let directory = FileManager.default.temporaryDirectory.path
+        let sunPathCapacity = 104
+        let prefix = directory + "/.s"
+        let available = sunPathCapacity - prefix.utf8.count - 1
+        let tokenLength = min(16, max(4, available))
+        let token = UUID().uuidString.replacingOccurrences(of: "-", with: "")
+            .prefix(tokenLength)
+        return "\(prefix)\(token)"
     }
 
     init(
@@ -404,7 +408,7 @@ final class FeatureCoordinator {
     private let requiresConfirmation: Bool
     private let templateStorageURL: URL?
     private let safetyPreferencesStore: SafetyPreferencesStore
-    private let permanentDeleteConfirmation: PermanentDeleteConfirmationProvider
+    private var permanentDeleteConfirmation: PermanentDeleteConfirmationProvider
     private let permanentDeletionWillIsolate: (@MainActor (URL) -> Void)?
     private let errorPresentation: (@MainActor (String) -> Void)?
     private(set) var configuration: MenuConfiguration
@@ -433,10 +437,14 @@ final class FeatureCoordinator {
         self.safetyPreferencesStore = safetyPreferencesStore
         self.permanentDeletionWillIsolate = permanentDeletionWillIsolate
         self.errorPresentation = errorPresentation
-        self.permanentDeleteConfirmation = permanentDeleteConfirmation ?? { urls in
-            await FeatureCoordinator.requestPermanentDeleteConfirmation(for: urls)
-        }
+        self.permanentDeleteConfirmation = permanentDeleteConfirmation ?? { _ in false }
         configuration = ConfigurationStore.load(defaults: configurationDefaults)
+        if permanentDeleteConfirmation == nil {
+            self.permanentDeleteConfirmation = { [weak self] urls in
+                guard let self else { return false }
+                return await self.requestPermanentDeleteConfirmation(for: urls)
+            }
+        }
     }
 
     func updateConfiguration(_ value: MenuConfiguration) {
@@ -1357,9 +1365,13 @@ final class FeatureCoordinator {
             && status.st_mode & S_IFMT == target.fileType
     }
 
-    private static func requestPermanentDeleteConfirmation(for urls: [URL]) async -> Bool {
-        guard let hostURL = containingHostApplicationURL(),
-              let expectedHostCodeHash = HostCodeIdentity.codeHash(at: hostURL) else {
+    private func requestPermanentDeleteConfirmation(for urls: [URL]) async -> Bool {
+        guard let hostURL = Self.containingHostApplicationURL() else {
+            showError(t("无法定位宿主应用，请确认扩展已正确嵌入 App 包内。"))
+            return false
+        }
+        guard let expectedHostCodeHash = HostCodeIdentity.codeHash(at: hostURL) else {
+            showError(t("无法验证宿主应用的代码签名。"))
             return false
         }
 
@@ -1381,6 +1393,7 @@ final class FeatureCoordinator {
                 expectedRequestDigest: request.authenticationDigest
             )
         } catch {
+            showError(t("无法建立确认通道：\(error.localizedDescription)"))
             return false
         }
         defer { server.invalidate() }
@@ -1389,18 +1402,20 @@ final class FeatureCoordinator {
         do {
             requestURL = try DestructiveConfirmationBridge.writeRequest(request)
         } catch {
+            showError(t("无法写入确认请求文件：\(error.localizedDescription)"))
             return false
         }
         defer { DestructiveConfirmationBridge.removeRequest(at: requestURL) }
 
-        launchHostApplicationIfNeeded(at: hostURL, requestURL: requestURL)
+        Self.launchHostApplicationIfNeeded(at: hostURL, requestURL: requestURL)
+        DestructiveConfirmationBridge.postRequest(at: requestURL)
         let remainingLifetime = DestructiveConfirmationBridge.remainingResponseLifetime(
             for: request
         )
         guard remainingLifetime > 0 else { return false }
         let timeoutMilliseconds = Int64((remainingLifetime * 1_000).rounded(.down))
 
-        return await withTaskGroup(of: Bool.self) { group in
+        let confirmedResult: Bool? = await withTaskGroup(of: Bool?.self) { group in
             group.addTask {
                 await Task.detached(priority: .userInitiated) {
                     server.receiveResponse()
@@ -1409,32 +1424,33 @@ final class FeatureCoordinator {
             group.addTask {
                 do {
                     try await Task.sleep(for: .milliseconds(timeoutMilliseconds))
-                } catch {
-                    return false
-                }
-                return false
+                } catch { }
+                return nil
             }
             group.addTask {
-                // DNC 仅作为不可信的唤醒提示。持续重发直到收到经 socket peer
-                // 代码身份验证且与展示上下文绑定的响应或绝对期限届满。
                 while !Task.isCancelled {
-                    DestructiveConfirmationBridge.postRequest(at: requestURL)
                     do {
-                        try await Task.sleep(for: .milliseconds(500))
-                    } catch {
-                        return false
-                    }
+                        try await Task.sleep(for: .milliseconds(150))
+                    } catch { break }
+                    DestructiveConfirmationBridge.postRequest(at: requestURL)
                 }
-                return false
+                return nil
             }
-            let result = await group.next() ?? false
+            let firstResult = await group.next() ?? nil
             let isUnexpired = DestructiveConfirmationBridge.remainingResponseLifetime(
                 for: request
             ) > 0
             server.invalidate()
             group.cancelAll()
-            return result && isUnexpired
+            if let approved = firstResult {
+                return approved && isUnexpired
+            }
+            return nil
         }
+        if confirmedResult == nil {
+            showError(t("确认超时或宿主应用未响应，请确认 SuperRightClick 主应用已运行。"))
+        }
+        return confirmedResult ?? false
     }
 
     private static func launchHostApplicationIfNeeded(
