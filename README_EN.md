@@ -9,7 +9,7 @@
   </p>
 
   <p>
-    <a href="https://github.com/zijieloooooou/SuperRightClick/releases/latest"><img src="https://img.shields.io/badge/Download_Latest-DMG-2563EB?style=for-the-badge&logo=github" alt="Download the latest DMG"></a>
+    <a href="https://github.com/zijielou/SuperRightClick/releases/latest"><img src="https://img.shields.io/badge/Download_Latest-DMG-2563EB?style=for-the-badge&logo=github" alt="Download the latest DMG"></a>
   </p>
 
   <p>
@@ -84,7 +84,7 @@ SuperRightClick enhances the macOS Finder context menu through a Finder Sync ext
 No Xcode installation or local build is required. Download the DMG and install the app directly:
 
 <p>
-  <a href="https://github.com/zijieloooooou/SuperRightClick/releases/latest"><img src="https://img.shields.io/badge/Open_GitHub_Releases-Download_Latest_DMG-2563EB?style=for-the-badge&logo=github" alt="Open GitHub Releases and download the latest DMG"></a>
+  <a href="https://github.com/zijielou/SuperRightClick/releases/latest"><img src="https://img.shields.io/badge/Open_GitHub_Releases-Download_Latest_DMG-2563EB?style=for-the-badge&logo=github" alt="Open GitHub Releases and download the latest DMG"></a>
 </p>
 
 1. Open the download page above and download the `.dmg` file under the latest release's **Assets** section.
@@ -130,4 +130,4 @@ No. The current release has no log system that appends an entry for every file o
 
 ## Feedback
 
-If you find a problem or have a feature request, please open an issue in [GitHub Issues](https://github.com/zijieloooooou/SuperRightClick/issues).
+If you find a problem or have a feature request, please open an issue in [GitHub Issues](https://github.com/zijielou/SuperRightClick/issues).

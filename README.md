@@ -8,9 +8,9 @@
 
 ![简体中文](https://img.shields.io/badge/简体中文-当前语言-4F46E5?style=for-the-badge) ![English](https://img.shields.io/badge/English-Switch-64748B?style=for-the-badge)
 
-![下载最新 DMG](https://img.shields.io/badge/下载最新版本-DMG-2563EB?style=for-the-badge&logo=github)
+[![下载最新 DMG](https://img.shields.io/badge/下载最新版本-DMG-2563EB?style=for-the-badge&logo=github)](https://github.com/zijielou/SuperRightClick/releases/latest)
 
-![macOS 15.0+](https://img.shields.io/badge/macOS-15.0%2B-111827?style=flat-square&logo=apple) ![仅支持 Apple Silicon M 系列](https://img.shields.io/badge/Apple%20Silicon-M%20Series%20only-111827?style=flat-square&logo=apple) ![Version 0.1.0](https://img.shields.io/badge/version-0.2.0-2563EB?style=flat-square)
+![macOS 15.0+](https://img.shields.io/badge/macOS-15.0%2B-111827?style=flat-square&logo=apple) ![仅支持 Apple Silicon M 系列](https://img.shields.io/badge/Apple%20Silicon-M%20Series%20only-111827?style=flat-square&logo=apple) ![Version 0.2.0](https://img.shields.io/badge/version-0.2.0-2563EB?style=flat-square)
 
 SuperRightClick 通过 Finder Sync 扩展增强 macOS Finder 的右键菜单，让新建文件、复制路径、移动文件、图片转换等常用操作无需离开 Finder 即可完成。菜单内容、名称、顺序和图标均可按个人习惯配置。
 
@@ -89,7 +89,7 @@ SuperRightClick 通过 Finder Sync 扩展增强 macOS Finder 的右键菜单，�
 
 无需安装 Xcode 或自行编译，直接下载 DMG 即可使用：
 
-![前往 GitHub Releases 下载最新 DMG](https://img.shields.io/badge/前往_GitHub_Releases-下载最新_DMG-2563EB?style=for-the-badge&logo=github)
+[![前往 GitHub Releases 下载最新 DMG](https://img.shields.io/badge/前往_GitHub_Releases-下载最新_DMG-2563EB?style=for-the-badge&logo=github)](https://github.com/zijielou/SuperRightClick/releases/latest)
 
 1. 打开上方下载页面，在最新版本的 **Assets** 中下载 `.dmg` 文件。
 2. 打开 DMG，将 `SuperRightClick.app` 拖入"应用程序"文件夹。
@@ -142,4 +142,4 @@ SuperRightClick 通过 Finder Sync 扩展增强 macOS Finder 的右键菜单，�
 
 ## 问题反馈
 
-如果遇到问题或者有功能建议，请前往 [GitHub Issues](https://github.com/zijieloooooou/SuperRightClick/issues) 反馈。
+如果遇到问题或者有功能建议，请前往 [GitHub Issues](https://github.com/zijielou/SuperRightClick/issues) 反馈。
