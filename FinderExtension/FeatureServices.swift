@@ -1,59 +1,19 @@
 @preconcurrency import AppKit
+import CoreImage
 import CryptoKit
 import Foundation
 import ImageIO
-import Security
 import UniformTypeIdentifiers
 
-enum HostCodeIdentity {
-    static func codeHash(at applicationURL: URL) -> Data? {
-        var staticCode: SecStaticCode?
-        guard SecStaticCodeCreateWithPath(
-            applicationURL as CFURL,
-            SecCSFlags(),
-            &staticCode
-        ) == errSecSuccess,
-        let staticCode else { return nil }
-        return signingHash(for: staticCode)
-    }
-
-    static func codeHash(processIdentifier: pid_t) -> Data? {
-        let attributes = [
-            kSecGuestAttributePid as String: NSNumber(value: processIdentifier),
-        ] as CFDictionary
-        var code: SecCode?
-        guard SecCodeCopyGuestWithAttributes(
-            nil,
-            attributes,
-            SecCSFlags(),
-            &code
-        ) == errSecSuccess,
-        let code,
-        SecCodeCheckValidity(code, SecCSFlags(), nil) == errSecSuccess else { return nil }
-        var staticCode: SecStaticCode?
-        guard SecCodeCopyStaticCode(code, SecCSFlags(), &staticCode) == errSecSuccess,
-              let staticCode else { return nil }
-        return signingHash(for: staticCode)
-    }
-
-    private static func signingHash(for code: SecStaticCode) -> Data? {
-        var information: CFDictionary?
-        guard SecCodeCopySigningInformation(
-            code,
-            SecCSFlags(rawValue: kSecCSSigningInformation),
-            &information
-        ) == errSecSuccess,
-        let dictionary = information as? [String: Any] else { return nil }
-        return dictionary[kSecCodeInfoUnique as String] as? Data
-    }
-}
-
-final class AuthenticatedDestructiveConfirmationServer: @unchecked Sendable {
+/// Receives one response from the signed containing application. Request ID and
+/// digest prevent a valid host response from being replayed for another request.
+final class AuthenticatedHostResponseServer<Response: AuthenticatedHostResponse>:
+    @unchecked Sendable {
     let socketPath: String
 
-    private static let pollIntervalMilliseconds: Int32 = 100
-    private static let responseReadTimeout: Duration = .seconds(2)
-    private static let maximumResponseSize = 4 * 1024
+    private static var pollIntervalMilliseconds: Int32 { 100 }
+    private static var responseReadTimeout: Duration { .seconds(2) }
+    private let maximumResponseSize: Int
     private let requestID: UUID
     private let expectedHostCodeHash: Data
     private let expectedRequestDigest: Data
@@ -75,23 +35,25 @@ final class AuthenticatedDestructiveConfirmationServer: @unchecked Sendable {
         socketPath: String,
         requestID: UUID,
         expectedHostCodeHash: Data,
-        expectedRequestDigest: Data
+        expectedRequestDigest: Data,
+        maximumResponseSize: Int = 4 * 1024
     ) throws {
         self.socketPath = socketPath
         self.requestID = requestID
         self.expectedHostCodeHash = expectedHostCodeHash
         self.expectedRequestDigest = expectedRequestDigest
+        self.maximumResponseSize = maximumResponseSize
 
         let socketDescriptor = socket(AF_UNIX, SOCK_STREAM, 0)
         guard socketDescriptor >= 0 else {
-            throw SecureFileFailure.posix("无法创建永久删除确认通道", errno)
+            throw SecureFileFailure.posix("无法创建宿主界面响应通道", errno)
         }
         descriptor = socketDescriptor
         do {
             let flags = fcntl(socketDescriptor, F_GETFL)
             guard flags >= 0,
                   fcntl(socketDescriptor, F_SETFL, flags | O_NONBLOCK) == 0 else {
-                throw SecureFileFailure.posix("无法配置永久删除确认通道", errno)
+                throw SecureFileFailure.posix("无法配置宿主界面响应通道", errno)
             }
             var (address, length) = try LocalUnixSocket.address(for: socketPath)
             socketPath.withCString { path in
@@ -103,13 +65,13 @@ final class AuthenticatedDestructiveConfirmationServer: @unchecked Sendable {
                 }
             }
             guard bindResult == 0 else {
-                throw SecureFileFailure.posix("无法绑定永久删除确认通道", errno)
+                throw SecureFileFailure.posix("无法绑定宿主界面响应通道", errno)
             }
             guard socketPath.withCString({ chmod($0, 0o600) }) == 0 else {
-                throw SecureFileFailure.posix("无法设置永久删除确认通道权限", errno)
+                throw SecureFileFailure.posix("无法设置宿主界面响应通道权限", errno)
             }
             guard listen(socketDescriptor, 4) == 0 else {
-                throw SecureFileFailure.posix("无法监听永久删除确认通道", errno)
+                throw SecureFileFailure.posix("无法监听宿主界面响应通道", errno)
             }
         } catch {
             invalidate()
@@ -117,10 +79,10 @@ final class AuthenticatedDestructiveConfirmationServer: @unchecked Sendable {
         }
     }
 
-    func receiveResponse() -> Bool {
+    func receiveResponse() -> Response? {
         while true {
             let listeningDescriptor = currentDescriptor()
-            guard listeningDescriptor >= 0 else { return false }
+            guard listeningDescriptor >= 0 else { return nil }
 
             var pollDescriptor = pollfd(
                 fd: listeningDescriptor,
@@ -132,20 +94,20 @@ final class AuthenticatedDestructiveConfirmationServer: @unchecked Sendable {
                 1,
                 Self.pollIntervalMilliseconds
             )
-            guard isActive(listeningDescriptor) else { return false }
+            guard isActive(listeningDescriptor) else { return nil }
             if pollResult < 0 {
                 if errno == EINTR { continue }
-                return false
+                return nil
             }
             if pollResult == 0 { continue }
             let failureEvents = Int16(POLLERR | POLLHUP | POLLNVAL)
-            if pollDescriptor.revents & failureEvents != 0 { return false }
+            if pollDescriptor.revents & failureEvents != 0 { return nil }
             guard pollDescriptor.revents & Int16(POLLIN) != 0 else { continue }
 
             lock.lock()
             guard descriptor == listeningDescriptor else {
                 lock.unlock()
-                return false
+                return nil
             }
             let client = accept(listeningDescriptor, nil, nil)
             let acceptError = errno
@@ -156,7 +118,7 @@ final class AuthenticatedDestructiveConfirmationServer: @unchecked Sendable {
                     acceptError == EWOULDBLOCK {
                     continue
                 }
-                return false
+                return nil
             }
             defer { _ = close(client) }
 
@@ -179,17 +141,18 @@ final class AuthenticatedDestructiveConfirmationServer: @unchecked Sendable {
                 continue
             }
 
+            // A host probe connects only to authenticate this server and closes
+            // without a payload. Malformed/truncated authenticated connections
+            // must not terminate the real request listener.
             guard let response = readResponse(
                 from: client,
                 whileListeningOn: listeningDescriptor
-            ) else {
-                return false
-            }
+            ) else { continue }
             guard response.requestID == requestID,
                   response.requestDigest == expectedRequestDigest else {
                 continue
             }
-            return response.approved
+            return response
         }
     }
 
@@ -208,14 +171,14 @@ final class AuthenticatedDestructiveConfirmationServer: @unchecked Sendable {
     private func readResponse(
         from client: Int32,
         whileListeningOn listeningDescriptor: Int32
-    ) -> DestructiveConfirmationResponse? {
+    ) -> Response? {
         let clock = ContinuousClock()
         let deadline = clock.now.advanced(by: Self.responseReadTimeout)
         var data = Data()
         var reachedEndOfStream = false
         var buffer = [UInt8](repeating: 0, count: 1024)
 
-        while data.count <= Self.maximumResponseSize, clock.now < deadline {
+        while data.count <= maximumResponseSize, clock.now < deadline {
             guard isActive(listeningDescriptor) else { return nil }
             var pollDescriptor = pollfd(
                 fd: client,
@@ -258,11 +221,11 @@ final class AuthenticatedDestructiveConfirmationServer: @unchecked Sendable {
         guard reachedEndOfStream,
               isActive(listeningDescriptor),
               !data.isEmpty,
-              data.count <= Self.maximumResponseSize else {
+              data.count <= maximumResponseSize else {
             return nil
         }
         return try? JSONDecoder().decode(
-            DestructiveConfirmationResponse.self,
+            Response.self,
             from: data
         )
     }
@@ -281,6 +244,40 @@ final class AuthenticatedDestructiveConfirmationServer: @unchecked Sendable {
 
     deinit {
         invalidate()
+    }
+}
+
+/// Compatibility wrapper retained for the permanent-delete path and its tests.
+/// New host-owned UI should use `AuthenticatedHostResponseServer` directly.
+final class AuthenticatedDestructiveConfirmationServer: @unchecked Sendable {
+    private let server: AuthenticatedHostResponseServer<DestructiveConfirmationResponse>
+
+    var socketPath: String { server.socketPath }
+
+    static func makeSocketPath() -> String {
+        AuthenticatedHostResponseServer<DestructiveConfirmationResponse>.makeSocketPath()
+    }
+
+    init(
+        socketPath: String,
+        requestID: UUID,
+        expectedHostCodeHash: Data,
+        expectedRequestDigest: Data
+    ) throws {
+        server = try AuthenticatedHostResponseServer(
+            socketPath: socketPath,
+            requestID: requestID,
+            expectedHostCodeHash: expectedHostCodeHash,
+            expectedRequestDigest: expectedRequestDigest
+        )
+    }
+
+    func receiveResponse() -> Bool {
+        server.receiveResponse()?.approved ?? false
+    }
+
+    func invalidate() {
+        server.invalidate()
     }
 }
 
@@ -402,16 +399,375 @@ enum UniqueName {
 
 typealias PermanentDeleteConfirmationProvider = @MainActor @Sendable ([URL]) async -> Bool
 
+/// A stable identity for a directory entry. Paths alone are unsafe for deferred
+/// destructive operations because another item can replace the original path
+/// between the menu action and execution on the file-operation queue.
+private struct FileIdentity: Codable, Hashable, Sendable {
+    let device: UInt64
+    let inode: UInt64
+    let fileType: UInt32
+
+    init(status: stat) {
+        device = UInt64(status.st_dev)
+        inode = UInt64(status.st_ino)
+        fileType = UInt32(status.st_mode & S_IFMT)
+    }
+
+    static func capture(at url: URL) -> FileIdentity? {
+        guard case let .found(identity) = captureResult(at: url) else {
+            return nil
+        }
+        return identity
+    }
+
+    static func captureResult(at url: URL) -> FileIdentityCaptureResult {
+        var status = stat()
+        guard url.standardizedFileURL.path.withCString({ lstat($0, &status) }) == 0 else {
+            let code = errno
+            return code == ENOENT ? .missing : .unavailable(code)
+        }
+        return .found(FileIdentity(status: status))
+    }
+
+    func matchesEntry(at url: URL) -> Bool {
+        guard let current = Self.capture(at: url) else { return false }
+        return current == self
+    }
+
+    /// Resolves the source and target independently through kernel-backed file
+    /// descriptors. Do not walk `..` from the target descriptor: an implicit
+    /// NSOpenPanel scope grants the selected directory and its descendants, but
+    /// intentionally may not grant its parent (a normal sibling transfer).
+    ///
+    /// `F_GETPATH` supplies the kernel-resolved spelling for both sides, which
+    /// handles symlinked paths and case-insensitive volumes. If the requested
+    /// target does not exist yet, only its nearest lexically-addressable existing
+    /// ancestor is opened and the missing components are appended. `nil` means
+    /// the relationship could not be verified safely.
+    func isAncestor(
+        entryAt sourceURL: URL,
+        ofDirectoryAt requestedURL: URL
+    ) -> Bool? {
+        guard fileType == UInt32(S_IFDIR) else { return false }
+
+        guard let source = Self.openedDirectoryLocation(
+            at: sourceURL,
+            followFinalSymlink: false,
+            allowMissing: false
+        ), source.identity == self,
+        let target = Self.openedDirectoryLocation(
+            at: requestedURL,
+            followFinalSymlink: true,
+            allowMissing: true
+        ) else { return nil }
+
+        if source.identity.device == target.identity.device,
+           source.identity.inode == target.identity.inode {
+            return true
+        }
+
+        guard target.pathComponents.count >= source.pathComponents.count else {
+            return false
+        }
+        let caseSensitive = source.volumeIsCaseSensitive
+        for index in source.pathComponents.indices {
+            let sourceComponent = source.pathComponents[index]
+            let targetComponent = target.pathComponents[index]
+            if caseSensitive {
+                guard sourceComponent == targetComponent else { return false }
+            } else {
+                guard sourceComponent.compare(
+                    targetComponent,
+                    options: [.caseInsensitive],
+                    range: nil,
+                    locale: Locale(identifier: "en_US_POSIX")
+                ) == .orderedSame else { return false }
+            }
+        }
+        return true
+    }
+
+    private struct OpenedDirectoryLocation {
+        let identity: FileIdentity
+        let pathComponents: [String]
+        let volumeIsCaseSensitive: Bool
+    }
+
+    private static func openedDirectoryLocation(
+        at input: URL,
+        followFinalSymlink: Bool,
+        allowMissing: Bool
+    ) -> OpenedDirectoryLocation? {
+        var candidate = input.standardizedFileURL
+        var missingComponents: [String] = []
+
+        while true {
+            let noFollow = followFinalSymlink ? 0 : O_NOFOLLOW
+            let descriptor = candidate.path.withCString {
+                open($0, O_RDONLY | O_DIRECTORY | O_CLOEXEC | noFollow)
+            }
+            if descriptor >= 0 {
+                defer { _ = close(descriptor) }
+                var status = stat()
+                guard fstat(descriptor, &status) == 0,
+                      let kernelPath = kernelPath(for: descriptor) else {
+                    return nil
+                }
+                var components = URL(fileURLWithPath: kernelPath)
+                    .standardizedFileURL.pathComponents
+                components.append(contentsOf: missingComponents)
+                // If volume metadata is unavailable, assuming case-insensitive
+                // can only reject an otherwise safe transfer; it cannot permit a
+                // recursive self-copy on a case-insensitive volume.
+                let caseSensitive = (try? URL(fileURLWithPath: kernelPath)
+                    .resourceValues(forKeys: [.volumeSupportsCaseSensitiveNamesKey])
+                    .volumeSupportsCaseSensitiveNames) ?? false
+                return OpenedDirectoryLocation(
+                    identity: FileIdentity(status: status),
+                    pathComponents: components,
+                    volumeIsCaseSensitive: caseSensitive
+                )
+            }
+
+            let code = errno
+            guard allowMissing, code == ENOENT else { return nil }
+            let parent = candidate.deletingLastPathComponent()
+            let component = candidate.lastPathComponent
+            guard !component.isEmpty,
+                  component != ".",
+                  component != "..",
+                  parent.path != candidate.path else { return nil }
+            missingComponents.insert(component, at: 0)
+            candidate = parent
+        }
+    }
+
+    private static func kernelPath(for descriptor: Int32) -> String? {
+        var buffer = [CChar](repeating: 0, count: Int(MAXPATHLEN))
+        let result = buffer.withUnsafeMutableBufferPointer { pointer in
+            fcntl(
+                descriptor,
+                F_GETPATH,
+                UnsafeMutableRawPointer(pointer.baseAddress!)
+            )
+        }
+        guard result == 0 else { return nil }
+        let end = buffer.firstIndex(of: 0) ?? buffer.endIndex
+        return String(
+            decoding: buffer[..<end].map { UInt8(bitPattern: $0) },
+            as: UTF8.self
+        )
+    }
+}
+
+private enum FileIdentityCaptureResult: Sendable {
+    case found(FileIdentity)
+    case missing
+    case unavailable(Int32)
+}
+
+/// Captures both the directory entry and the directory reached by following a
+/// final symlink. This preserves symlink-to-directory shortcuts while detecting
+/// replacement of either the link or its destination before every mutation.
+private struct DirectoryIdentity: Sendable, Equatable {
+    let entry: FileIdentity
+    let resolvedDirectory: FileIdentity
+
+    static func captureResult(at url: URL) -> DirectoryIdentityCaptureResult {
+        switch FileIdentity.captureResult(at: url) {
+        case let .found(entry):
+            var status = stat()
+            guard url.standardizedFileURL.path.withCString({ stat($0, &status) }) == 0 else {
+                return .unavailable(errno)
+            }
+            let resolved = FileIdentity(status: status)
+            guard resolved.fileType == UInt32(S_IFDIR) else {
+                return .notDirectory
+            }
+            return .found(DirectoryIdentity(entry: entry, resolvedDirectory: resolved))
+        case .missing:
+            return .missing
+        case let .unavailable(code):
+            return .unavailable(code)
+        }
+    }
+
+    func stillMatches(at url: URL) -> Bool {
+        guard case let .found(current) = Self.captureResult(at: url) else {
+            return false
+        }
+        return current == self
+    }
+}
+
+private enum DirectoryIdentityCaptureResult: Sendable {
+    case found(DirectoryIdentity)
+    case missing
+    case notDirectory
+    case unavailable(Int32)
+}
+
+private enum DirectoryTargetExpectation: Sendable {
+    case existing(DirectoryIdentity)
+    case missing
+    case invalid
+    case unavailable(Int32)
+
+    static func capture(at url: URL) -> DirectoryTargetExpectation {
+        switch DirectoryIdentity.captureResult(at: url) {
+        case let .found(identity): .existing(identity)
+        case .missing: .missing
+        case .notDirectory: .invalid
+        case let .unavailable(code): .unavailable(code)
+        }
+    }
+}
+
+private struct CutItemSnapshot: Codable, Hashable, Sendable {
+    let path: String
+    let identity: FileIdentity
+    var wasTemporarilyHidden: Bool
+
+    var url: URL { URL(fileURLWithPath: path) }
+
+    func stillMatches() -> Bool {
+        identity.matchesEntry(at: url)
+    }
+}
+
+private struct CutSession: Codable, Hashable, Sendable {
+    let id: UUID
+    var items: [CutItemSnapshot]
+}
+
+/// A tiny awaitable result used by `FileOperationWorker`. The serial Dispatch
+/// queue is entered synchronously in `enqueue`, so jobs retain the exact order
+/// in which Finder menu actions submitted them.
+private final class FileOperationResultBox<Value: Sendable>: @unchecked Sendable {
+    private let lock = NSLock()
+    private var result: Value?
+    private var waiters: [CheckedContinuation<Value, Never>] = []
+
+    func resolve(_ value: Value) {
+        lock.lock()
+        precondition(result == nil, "A file-operation result can only be resolved once")
+        result = value
+        let pending = waiters
+        waiters.removeAll()
+        lock.unlock()
+        pending.forEach { $0.resume(returning: value) }
+    }
+
+    func value() async -> Value {
+        await withCheckedContinuation { continuation in
+            lock.lock()
+            if let result {
+                lock.unlock()
+                continuation.resume(returning: result)
+            } else {
+                waiters.append(continuation)
+                lock.unlock()
+            }
+        }
+    }
+}
+
+private struct FileOperationTicket<Value: Sendable>: Sendable {
+    private let box: FileOperationResultBox<Value>
+
+    init(box: FileOperationResultBox<Value>) {
+        self.box = box
+    }
+
+    func value() async -> Value {
+        await box.value()
+    }
+}
+
+private final class FileOperationWorker: @unchecked Sendable {
+    private let queue = DispatchQueue(
+        label: "local.SuperRightClick.file-operations",
+        qos: .userInitiated
+    )
+
+    func enqueue<Value: Sendable>(
+        _ operation: @escaping @Sendable () -> Value
+    ) -> FileOperationTicket<Value> {
+        let box = FileOperationResultBox<Value>()
+        queue.async {
+            box.resolve(operation())
+        }
+        return FileOperationTicket(box: box)
+    }
+}
+
+/// Foundation documents FileManager's methods as safe to call from multiple
+/// threads. The SDK type has not adopted Sendable, so confine this explicit
+/// unchecked wrapper to the single serial file-operation queue.
+private final class SendableFileManager: @unchecked Sendable {
+    let value: FileManager
+
+    init(_ value: FileManager) {
+        self.value = value
+    }
+}
+
+private struct FileOperationIssue: Sendable {
+    let url: URL
+    let message: String
+}
+
+private struct TransferSource: Sendable {
+    let url: URL
+    let expectedIdentity: FileIdentity?
+    let restoreVisibilityAfterMove: Bool
+}
+
+private struct TransferResult: Sendable {
+    let failedSources: [URL]
+    let issues: [FileOperationIssue]
+    let movedSources: [URL]
+    let visibilityRestorationFailures: [CutItemSnapshot]
+    let didPerformOperation: Bool
+}
+
+private struct PendingPaste: Sendable {
+    let ticket: FileOperationTicket<TransferResult>
+    /// Non-nil means this paste consumes SuperRightClick's cut session. An
+    /// empty array is meaningful when every recorded item became stale.
+    let cutItems: [CutItemSnapshot]?
+    /// Completion may update persisted cut state only if this exact session is
+    /// still current. A later Cut action must always win over an older paste.
+    let cutSessionID: UUID?
+    let preliminaryIssues: [String]
+}
+
+private struct DissolveResult: Sendable {
+    let didDissolve: Bool
+    let issues: [FileOperationIssue]
+}
+
+private struct DeletionResult: Sendable {
+    let deletedCount: Int
+    let issues: [FileOperationIssue]
+}
+
 @MainActor
 final class FeatureCoordinator {
     private let fileManager: FileManager
+    private let backgroundFileManager: SendableFileManager
     private let requiresConfirmation: Bool
     private let templateStorageURL: URL?
     private let safetyPreferencesStore: SafetyPreferencesStore
+    private let pasteboard: NSPasteboard
     private var permanentDeleteConfirmation: PermanentDeleteConfirmationProvider
     private let permanentDeletionWillIsolate: (@MainActor (URL) -> Void)?
     private let errorPresentation: (@MainActor (String) -> Void)?
+    private let fileOperationWorker = FileOperationWorker()
+    private var visibilityRestorationRetryTask: Task<Void, Never>?
     private(set) var configuration: MenuConfiguration
+    private var configurationSnapshot: ConfigurationSnapshot
+    private var legacyConfigurationMigrationComplete: Bool
 
     /// 测试必须传入独立的 configurationDefaults 并关闭 publishChanges，
     /// 否则测试数据会写入真实配置并通过分布式通知污染正在运行的应用。
@@ -425,39 +781,79 @@ final class FeatureCoordinator {
         configurationDefaults: UserDefaults = .standard,
         publishChanges: Bool = true,
         safetyPreferencesStore: SafetyPreferencesStore = .production,
+        pasteboard: NSPasteboard = .general,
         permanentDeleteConfirmation: PermanentDeleteConfirmationProvider? = nil,
         permanentDeletionWillIsolate: (@MainActor (URL) -> Void)? = nil,
         errorPresentation: (@MainActor (String) -> Void)? = nil
     ) {
         self.fileManager = fileManager
+        backgroundFileManager = SendableFileManager(fileManager)
         self.requiresConfirmation = requiresConfirmation
         self.templateStorageURL = templateStorageURL
         self.configurationDefaults = configurationDefaults
         self.publishChanges = publishChanges
         self.safetyPreferencesStore = safetyPreferencesStore
+        self.pasteboard = pasteboard
         self.permanentDeletionWillIsolate = permanentDeletionWillIsolate
         self.errorPresentation = errorPresentation
         self.permanentDeleteConfirmation = permanentDeleteConfirmation ?? { _ in false }
-        configuration = ConfigurationStore.load(defaults: configurationDefaults)
+        let initialSnapshot = ConfigurationStore.loadSnapshot(defaults: configurationDefaults)
+        let migration = ConfigurationStore.migrateLegacyExtensionAdditions(
+            basedOn: initialSnapshot,
+            defaults: configurationDefaults,
+            publish: publishChanges
+        )
+        configurationSnapshot = migration.snapshot
+        configuration = migration.snapshot.configuration
+        legacyConfigurationMigrationComplete = migration.isComplete
         if permanentDeleteConfirmation == nil {
             self.permanentDeleteConfirmation = { [weak self] urls in
                 guard let self else { return false }
                 return await self.requestPermanentDeleteConfirmation(for: urls)
             }
         }
+        if !loadPendingVisibilityRestorations().isEmpty {
+            scheduleVisibilityRestorationRetry()
+        }
     }
 
     func updateConfiguration(_ value: MenuConfiguration) {
-        let retained = Set(value.templates.compactMap(\.storedFilename))
-        let removed = configuration.templates.compactMap(\.storedFilename).filter {
-            !retained.contains($0)
+        // Direct injection is used by tests and local feature toggles. It is not
+        // evidence of a committed authoritative revision, so it must never run
+        // resource garbage collection.
+        configuration = value.validatedAndNormalized()
+    }
+
+    func updateConfiguration(_ snapshot: ConfigurationSnapshot) {
+        guard snapshot.isAuthoritative else { return }
+        var effectiveSnapshot = snapshot
+        if !legacyConfigurationMigrationComplete {
+            let migration = ConfigurationStore.migrateLegacyExtensionAdditions(
+                basedOn: snapshot,
+                defaults: configurationDefaults,
+                publish: publishChanges
+            )
+            effectiveSnapshot = migration.snapshot
+            legacyConfigurationMigrationComplete = migration.isComplete
         }
-        if !removed.isEmpty, let directory = try? templatesDirectory() {
-            for filename in removed {
-                try? fileManager.removeItem(at: directory.appendingPathComponent(filename))
+        let value = effectiveSnapshot.configuration.validatedAndNormalized()
+        // Never garbage-collect against a fallback/non-authoritative baseline or
+        // before every viable extension-only legacy template has committed to
+        // the shared file. This keeps old template bytes recoverable throughout
+        // migration and across transient shared-store failures.
+        if legacyConfigurationMigrationComplete, configurationSnapshot.isAuthoritative {
+            let retained = Set(value.templates.compactMap(\.storedFilename))
+            let removed = configuration.templates.compactMap(\.storedFilename).filter {
+                MenuConfiguration.isValidStoredTemplateFilename($0) && !retained.contains($0)
+            }
+            if !removed.isEmpty, let directory = try? templatesDirectory() {
+                for filename in removed {
+                    try? fileManager.removeItem(at: directory.appendingPathComponent(filename))
+                }
             }
         }
         configuration = value
+        configurationSnapshot = effectiveSnapshot
     }
 
     // MARK: - A class
@@ -563,7 +959,7 @@ final class FeatureCoordinator {
         stack.spacing = 8
         stack.frame = NSRect(x: 0, y: 0, width: 280, height: 62)
         alert.accessoryView = stack
-        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        guard runModalInFront(alert) == .alertFirstButtonReturn else { return }
         do {
             let filename = try UniqueName.validatedFilename(field.stringValue)
             let template = enabled[popup.indexOfSelectedItem]
@@ -623,20 +1019,60 @@ final class FeatureCoordinator {
             kind: .custom,
             storedFilename: storedName
         )
-        // 同名同扩展名的模板视为替换，避免重复导入时菜单里堆积重复项。
-        if let existing = configuration.templates.firstIndex(where: {
-            $0.name.lowercased() == validName.lowercased()
-                && $0.fileExtension.lowercased() == ext
-        }) {
-            if let oldStored = configuration.templates[existing].storedFilename {
-                try? fileManager.removeItem(at: directory.appendingPathComponent(oldStored))
+        var workingSnapshot = configurationSnapshot
+        var proposedBase = configuration
+
+        for _ in 0..<2 {
+            var proposed = proposedBase
+            var replacedStoredFilename: String?
+            // 同名同扩展名的模板视为替换，避免重复导入时菜单里堆积重复项。
+            if let existing = proposed.templates.firstIndex(where: {
+                $0.name.lowercased() == validName.lowercased()
+                    && $0.fileExtension.lowercased() == ext
+            }) {
+                replacedStoredFilename = proposed.templates[existing].storedFilename
+                proposed.templates[existing] = template
+            } else {
+                proposed.templates.append(template)
             }
-            configuration.templates[existing] = template
-        } else {
-            configuration.templates.append(template)
+
+            let result = ConfigurationStore.save(
+                proposed,
+                basedOn: workingSnapshot,
+                defaults: configurationDefaults,
+                publish: publishChanges
+            )
+            if let committed = result.committedSnapshot {
+                configurationSnapshot = committed
+                configuration = committed.configuration
+                // The old referenced copy is removed only after the replacement
+                // configuration has committed. A CAS failure can never destroy it.
+                if let old = replacedStoredFilename,
+                   old != storedName,
+                   MenuConfiguration.isValidStoredTemplateFilename(old) {
+                    try? fileManager.removeItem(at: directory.appendingPathComponent(old))
+                }
+                return template
+            }
+            if case let .conflict(latest?) = result {
+                workingSnapshot = latest
+                proposedBase = latest.configuration
+                continue
+            }
+            break
         }
-        persistConfiguration()
-        return template
+
+        // Roll back only the UUID-named file created by this invocation. Existing
+        // user template data and the last committed configuration stay untouched.
+        try? fileManager.removeItem(at: destination)
+        let latest = ConfigurationStore.loadSnapshot(defaults: configurationDefaults)
+        if latest.isAuthoritative {
+            configurationSnapshot = latest
+            configuration = latest.configuration
+        } else if configurationDefaults === UserDefaults.standard {
+            ConfigurationStore.requestAppConfiguration()
+        }
+        throw OperationFailure(description: "配置已被其他进程更新，请重试。")
     }
 
     private func write(template: NewFileTemplate, to output: URL) throws {
@@ -649,7 +1085,8 @@ final class FeatureCoordinator {
             try Data("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n".utf8)
                 .write(to: output, options: .withoutOverwriting)
         case .custom:
-            guard let filename = template.storedFilename else {
+            guard let filename = template.storedFilename,
+                  MenuConfiguration.isValidStoredTemplateFilename(filename) else {
                 throw OperationFailure(description: "自定义模板记录不完整。")
             }
             let source = try templatesDirectory().appendingPathComponent(filename)
@@ -673,151 +1110,668 @@ final class FeatureCoordinator {
 
     // MARK: - B01/B02/B10/B11/B12
 
+    /// Submits a transfer without blocking Finder's main thread. The serial
+    /// worker preserves menu-action order even when a previous copy is large.
+    func transfer(_ sources: [URL], to directory: URL, move: Bool) {
+        guard !sources.isEmpty else { return }
+        let transferSources = sources.map {
+            TransferSource(
+                url: $0,
+                expectedIdentity: move ? FileIdentity.capture(at: $0) : nil,
+                restoreVisibilityAfterMove: false
+            )
+        }
+        let ticket = enqueueTransfer(transferSources, to: directory, move: move)
+        Task { @MainActor [weak self] in
+            let result = await ticket.value()
+            self?.presentTransferResult(result)
+        }
+    }
+
+    /// Deterministic async entry point used by regression tests and internal
+    /// workflows that must update state only after the transfer has completed.
     @discardableResult
-    func transfer(_ sources: [URL], to directory: URL, move: Bool) -> [URL] {
+    func transferAndWait(_ sources: [URL], to directory: URL, move: Bool) async -> [URL] {
         guard !sources.isEmpty else { return [] }
-        do {
-            try fileManager.createDirectory(at: directory, withIntermediateDirectories: true)
-        } catch {
-            showError(errorText(error))
-            return sources
+        let transferSources = sources.map {
+            TransferSource(
+                url: $0,
+                expectedIdentity: move ? FileIdentity.capture(at: $0) : nil,
+                restoreVisibilityAfterMove: false
+            )
+        }
+        let result = await enqueueTransfer(
+            transferSources,
+            to: directory,
+            move: move
+        ).value()
+        presentTransferResult(result)
+        return result.failedSources
+    }
+
+    private func enqueueTransfer(
+        _ sources: [TransferSource],
+        to directory: URL,
+        move: Bool
+    ) -> FileOperationTicket<TransferResult> {
+        let fileManager = backgroundFileManager
+        let language = configuration.language
+        let targetExpectation = DirectoryTargetExpectation.capture(at: directory)
+        return fileOperationWorker.enqueue {
+            Self.performTransfer(
+                sources,
+                to: directory,
+                move: move,
+                targetExpectation: targetExpectation,
+                fileManager: fileManager.value,
+                language: language
+            )
+        }
+    }
+
+    nonisolated private static func performTransfer(
+        _ sources: [TransferSource],
+        to directory: URL,
+        move: Bool,
+        targetExpectation: DirectoryTargetExpectation,
+        fileManager: FileManager,
+        language: AppLanguage
+    ) -> TransferResult {
+        var failedSources: [URL] = []
+        var issues: [FileOperationIssue] = []
+        var movedSources: [URL] = []
+        var visibilityRestorationFailures: [CutItemSnapshot] = []
+        var didPerformOperation = false
+
+        func issue(for url: URL, _ error: Error) -> FileOperationIssue {
+            FileOperationIssue(
+                url: url,
+                message: Localizer.format(
+                    "%@：%@",
+                    language: language,
+                    url.lastPathComponent,
+                    errorText(error, language: language)
+                )
+            )
         }
 
-        let standardizedTarget = PathSafety.standardized(directory)
-        let cutItemsThatWereHidden = hiddenCutPaths
-        var failedSources: [URL] = []
-        var failureMessages: [String] = []
+        switch targetExpectation {
+        case let .existing(identity) where !identity.stillMatches(at: directory):
+            let failure = OperationFailure(description: "目标文件夹已被替换或无法访问。")
+            return TransferResult(
+                failedSources: sources.map(\.url),
+                issues: [issue(for: directory, failure)],
+                movedSources: [],
+                visibilityRestorationFailures: [],
+                didPerformOperation: false
+            )
+        case .invalid:
+            let failure = OperationFailure(description: "目标位置不是文件夹。")
+            return TransferResult(
+                failedSources: sources.map(\.url),
+                issues: [issue(for: directory, failure)],
+                movedSources: [],
+                visibilityRestorationFailures: [],
+                didPerformOperation: false
+            )
+        case let .unavailable(code):
+            let failure = OperationFailure(
+                "目标文件夹无法安全验证（POSIX 错误 %@）。",
+                arguments: [String(code)]
+            )
+            return TransferResult(
+                failedSources: sources.map(\.url),
+                issues: [issue(for: directory, failure)],
+                movedSources: [],
+                visibilityRestorationFailures: [],
+                didPerformOperation: false
+            )
+        case .existing, .missing:
+            break
+        }
 
+        // Validate sources before creating the destination. In particular, a
+        // stale source whose path equals the requested destination must not be
+        // recreated as a directory and then recursively copied into itself.
+        var validated: [(source: TransferSource, identity: FileIdentity)] = []
         for source in sources {
-            do {
-                let standardizedSource = PathSafety.standardized(source)
-                let standardizedParent = PathSafety.standardized(source.deletingLastPathComponent())
-
-                // “移动到当前目录”应是无操作，而不是因为冲突命名逻辑把原文件
-                // 意外改名为“文件 2”。若它来自剪切状态，同时恢复可见性。
-                if move, standardizedParent == standardizedTarget {
-                    if cutItemsThatWereHidden.contains(source.path) {
-                        var visibleSource = source
-                        var values = URLResourceValues()
-                        values.isHidden = false
-                        try? visibleSource.setResourceValues(values)
-                    }
+            guard let currentIdentity = FileIdentity.capture(at: source.url) else {
+                failedSources.append(source.url)
+                issues.append(FileOperationIssue(
+                    url: source.url,
+                    message: Localizer.format(
+                        "%@：目标已不存在或无法访问。",
+                        language: language,
+                        source.url.lastPathComponent
+                    )
+                ))
+                continue
+            }
+            // A move is destructive. Identity capture failure at submission is
+            // not permission to recapture later and move a replacement object.
+            if move {
+                guard let expectedIdentity = source.expectedIdentity,
+                      expectedIdentity == currentIdentity else {
+                    failedSources.append(source.url)
+                    issues.append(FileOperationIssue(
+                        url: source.url,
+                        message: Localizer.format(
+                            "%@：源项目身份无法安全验证或已被替换。",
+                            language: language,
+                            source.url.lastPathComponent
+                        )
+                    ))
                     continue
                 }
+            }
+            validated.append((source, currentIdentity))
+        }
 
-                // 防止把目录复制/移动进自身后代，避免递归复制和难以恢复的部分结果。
-                if standardizedTarget.path.hasPrefix(standardizedSource.path + "/") {
-                    throw OperationFailure(description: "不能将项目放入它自身的子目录。")
+        var eligible: [(source: TransferSource, identity: FileIdentity)] = []
+        for item in validated {
+            switch item.identity.isAncestor(
+                entryAt: item.source.url,
+                ofDirectoryAt: directory
+            ) {
+            case true:
+                failedSources.append(item.source.url)
+                issues.append(issue(
+                    for: item.source.url,
+                    OperationFailure(description: "不能将项目放入它自身的子目录。")
+                ))
+            case nil where item.identity.fileType == UInt32(S_IFDIR):
+                failedSources.append(item.source.url)
+                issues.append(issue(
+                    for: item.source.url,
+                    OperationFailure(description: "无法安全验证源文件夹与目标文件夹的关系。")
+                ))
+            default:
+                eligible.append(item)
+            }
+        }
+
+        guard !eligible.isEmpty else {
+            return TransferResult(
+                failedSources: failedSources,
+                issues: issues,
+                movedSources: [],
+                visibilityRestorationFailures: [],
+                didPerformOperation: false
+            )
+        }
+
+        if case .missing = targetExpectation {
+            do {
+                try fileManager.createDirectory(at: directory, withIntermediateDirectories: true)
+            } catch {
+                let pending = eligible.map(\.source.url)
+                failedSources.append(contentsOf: pending)
+                issues.append(issue(for: directory, error))
+                return TransferResult(
+                    failedSources: failedSources,
+                    issues: issues,
+                    movedSources: [],
+                    visibilityRestorationFailures: [],
+                    didPerformOperation: false
+                )
+            }
+        }
+
+        guard case let .found(activeDirectoryIdentity) = DirectoryIdentity.captureResult(at: directory),
+              {
+                  if case let .existing(expectedIdentity) = targetExpectation {
+                      return expectedIdentity == activeDirectoryIdentity
+                  }
+                  return true
+              }() else {
+            let pending = eligible.map(\.source.url)
+            failedSources.append(contentsOf: pending)
+            issues.append(issue(
+                for: directory,
+                OperationFailure(description: "目标文件夹已被替换或无法访问。")
+            ))
+            return TransferResult(
+                failedSources: failedSources,
+                issues: issues,
+                movedSources: [],
+                visibilityRestorationFailures: [],
+                didPerformOperation: false
+            )
+        }
+
+        for (source, capturedIdentity) in eligible {
+            do {
+                guard activeDirectoryIdentity.stillMatches(at: directory) else {
+                    throw OperationFailure(description: "目标文件夹已被替换或无法访问。")
+                }
+                // Revalidate deferred move operations immediately before the
+                // destructive rename; never move a replacement at the same path.
+                if move, !capturedIdentity.matchesEntry(at: source.url) {
+                    throw OperationFailure(description: "目标已不存在或无法访问。")
+                }
+
+                // Moving to the current parent is a completed no-op. A cut item
+                // still needs its temporary hidden flag restored.
+                let sourceParentIdentity: DirectoryIdentity? = {
+                    guard case let .found(identity) = DirectoryIdentity.captureResult(
+                        at: source.url.deletingLastPathComponent()
+                    ) else { return nil }
+                    return identity
+                }()
+                if move,
+                   sourceParentIdentity?.resolvedDirectory
+                    == activeDirectoryIdentity.resolvedDirectory {
+                    if source.restoreVisibilityAfterMove {
+                        try setHidden(false, at: source.url)
+                        didPerformOperation = true
+                    }
+                    movedSources.append(source.url)
+                    continue
                 }
 
                 let destination = UniqueName.availableURL(
                     in: directory,
-                    baseName: source.deletingPathExtension().lastPathComponent,
-                    fileExtension: source.pathExtension.isEmpty ? nil : source.pathExtension,
+                    baseName: source.url.deletingPathExtension().lastPathComponent,
+                    fileExtension: source.url.pathExtension.isEmpty
+                        ? nil
+                        : source.url.pathExtension,
                     fileManager: fileManager
                 )
                 if move {
-                    try fileManager.moveItem(at: source, to: destination)
-                    if cutItemsThatWereHidden.contains(source.path) {
-                        var visibleDestination = destination
-                        var values = URLResourceValues()
-                        values.isHidden = false
-                        try? visibleDestination.setResourceValues(values)
+                    try fileManager.moveItem(at: source.url, to: destination)
+                    movedSources.append(source.url)
+                    if source.restoreVisibilityAfterMove {
+                        do {
+                            try setHidden(false, at: destination)
+                        } catch {
+                            issues.append(issue(for: destination, error))
+                            if let identity = FileIdentity.capture(at: destination) {
+                                visibilityRestorationFailures.append(CutItemSnapshot(
+                                    path: destination.standardizedFileURL.path,
+                                    identity: identity,
+                                    wasTemporarilyHidden: true
+                                ))
+                            }
+                        }
                     }
                 } else {
-                    try fileManager.copyItem(at: source, to: destination)
+                    try fileManager.copyItem(at: source.url, to: destination)
                 }
+                didPerformOperation = true
             } catch {
-                failedSources.append(source)
-                failureMessages.append(f(
-                    "%@：%@",
-                    source.lastPathComponent,
-                    errorText(error)
-                ))
+                failedSources.append(source.url)
+                issues.append(issue(for: source.url, error))
             }
         }
 
-        if failureMessages.isEmpty {
-            playOperationSound()
-        } else {
-            showError(failureMessages.joined(separator: "\n"))
-        }
-        return failedSources
+        return TransferResult(
+            failedSources: failedSources,
+            issues: issues,
+            movedSources: movedSources,
+            visibilityRestorationFailures: visibilityRestorationFailures,
+            didPerformOperation: didPerformOperation
+        )
     }
 
-    func chooseTransferDestination(for sources: [URL], move: Bool) {
-        let panel = NSOpenPanel()
-        panel.title = t(move ? "选择移动目标文件夹" : "选择复制目标文件夹")
-        panel.canChooseDirectories = true
-        panel.canChooseFiles = false
-        panel.allowsMultipleSelection = false
-        guard panel.runModal() == .OK, let target = panel.url else { return }
-        transfer(sources, to: target, move: move)
+    nonisolated private static func setHidden(_ hidden: Bool, at input: URL) throws {
+        var url = input
+        var values = URLResourceValues()
+        values.isHidden = hidden
+        try url.setResourceValues(values)
+    }
+
+    private func presentTransferResult(
+        _ result: TransferResult,
+        additionalIssues: [String] = []
+    ) {
+        let messages = additionalIssues + result.issues.map(\.message)
+        if messages.isEmpty {
+            if result.didPerformOperation { playOperationSound() }
+        } else {
+            showError(messages.joined(separator: "\n"))
+        }
+    }
+
+    func chooseTransferDestination(for sources: [URL], move: Bool) async {
+        guard !sources.isEmpty else { return }
+        // Capture destructive source identities before the user spends time in
+        // the picker. A replacement appearing at the same path must never be
+        // moved when the panel eventually closes.
+        let preparedSources = sources.map {
+            TransferSource(
+                url: $0,
+                expectedIdentity: move ? FileIdentity.capture(at: $0) : nil,
+                restoreVisibilityAfterMove: false
+            )
+        }
+        guard !move || preparedSources.allSatisfy({ $0.expectedIdentity != nil }) else {
+            showError(t("一个或多个源项目已不存在或无法访问。"))
+            return
+        }
+        guard
+              let bookmark = await requestTransferDestination(
+                  operation: move ? .move : .copy,
+                  sourceItemCount: sources.count
+              ) else { return }
+
+        do {
+            let resolution = try TransferDestinationPickerBridge
+                .resolveEphemeralBookmark(bookmark)
+            let target = resolution.url
+            // Resolving an interprocess bookmark implicitly starts its
+            // ephemeral sandbox scope for this extension process. Balance that
+            // scope even when resource validation below fails.
+            defer { target.stopAccessingSecurityScopedResource() }
+            guard try target.resourceValues(forKeys: [.isDirectoryKey]).isDirectory == true else {
+                throw OperationFailure(description: "所选目标文件夹已失效，请重新选择。")
+            }
+
+            let result = await enqueueTransfer(
+                preparedSources,
+                to: target,
+                move: move
+            ).value()
+            presentTransferResult(result)
+        } catch {
+            showError(errorText(error))
+        }
     }
 
     func cut(_ urls: [URL]) {
-        restorePreviouslyHiddenCutItems()
-        let paths = urls.map(\.path)
-        configurationDefaults.set(paths, forKey: "cutPaths")
-        guard configuration.hideCutItems else { return }
-        var hidden: [String] = []
-        for var url in urls {
-            guard (try? url.resourceValues(forKeys: [.isHiddenKey]).isHidden) != true else {
+        // Do not overwrite the only recovery record when a previous hidden cut
+        // item could not be made visible again. The user can retry after fixing
+        // permissions, while replacement objects are never touched.
+        guard restorePreviouslyHiddenCutItems() else { return }
+        var snapshots: [CutItemSnapshot] = []
+        var issues: [String] = []
+        var seen = Set<String>()
+
+        for input in urls {
+            let url = input.standardizedFileURL
+            guard seen.insert(url.path).inserted else { continue }
+            guard let identity = FileIdentity.capture(at: url) else {
+                issues.append(f("%@：目标已不存在或无法访问。", url.lastPathComponent))
                 continue
             }
-            var values = URLResourceValues()
-            values.isHidden = true
-            if (try? url.setResourceValues(values)) != nil {
-                hidden.append(url.path)
+
+            var snapshot = CutItemSnapshot(
+                path: url.path,
+                identity: identity,
+                wasTemporarilyHidden: false
+            )
+            if configuration.hideCutItems,
+               (try? url.resourceValues(forKeys: [.isHiddenKey]).isHidden) != true {
+                do {
+                    try Self.setHidden(true, at: url)
+                    snapshot.wasTemporarilyHidden = true
+                } catch {
+                    issues.append(f("%@：%@", url.lastPathComponent, errorText(error)))
+                }
             }
+            snapshots.append(snapshot)
         }
-        configurationDefaults.set(hidden, forKey: "hiddenCutPaths")
+
+        saveCutSession(
+            snapshots.isEmpty ? nil : CutSession(id: UUID(), items: snapshots)
+        )
+        if !issues.isEmpty { showError(issues.joined(separator: "\n")) }
     }
 
     func paste(into directory: URL) {
-        let paths = configurationDefaults.stringArray(forKey: "cutPaths") ?? []
-        if !paths.isEmpty {
-            let sources = paths.map { URL(fileURLWithPath: $0) }
-            let previouslyHidden = hiddenCutPaths
-            let failed = transfer(sources, to: directory, move: true)
-            if failed.isEmpty {
-                configurationDefaults.removeObject(forKey: "cutPaths")
-                configurationDefaults.removeObject(forKey: "hiddenCutPaths")
-            } else {
-                // 只保留失败项，用户可以修正权限/目标后再次粘贴；原先被临时
-                // 隐藏的失败项也继续记录，避免丢失恢复可见性的机会。
-                let failedPaths = failed.map(\.path)
-                configurationDefaults.set(failedPaths, forKey: "cutPaths")
-                configurationDefaults.set(
-                    failedPaths.filter { previouslyHidden.contains($0) },
-                    forKey: "hiddenCutPaths"
+        guard let pending = preparePaste(into: directory) else { return }
+        Task { @MainActor [weak self] in
+            let result = await pending.ticket.value()
+            self?.completePaste(pending, result: result)
+        }
+    }
+
+    func pasteAndWait(into directory: URL) async {
+        guard let pending = preparePaste(into: directory) else { return }
+        let result = await pending.ticket.value()
+        completePaste(pending, result: result)
+    }
+
+    private func preparePaste(into directory: URL) -> PendingPaste? {
+        let session = loadCutSession()
+        let recorded = session?.items ?? []
+        let valid = recorded.filter { $0.stillMatches() }
+        let stale = recorded.filter { !$0.stillMatches() }
+
+        if !valid.isEmpty, let session {
+            // Drop stale records before deferring the move. This prevents a new
+            // filesystem object at an old path from ever becoming a cut target.
+            guard compareAndSetCutSession(
+                expectedID: session.id,
+                replacementItems: valid
+            ) else {
+                showError(t("剪切内容已在另一个 Finder 窗口中更新，请重试粘贴。"))
+                return nil
+            }
+            let sources = valid.map {
+                TransferSource(
+                    url: $0.url,
+                    expectedIdentity: $0.identity,
+                    restoreVisibilityAfterMove: $0.wasTemporarilyHidden
                 )
             }
-            return
+            let staleIssues = stale.map {
+                f("%@：目标已不存在或无法访问。", $0.url.lastPathComponent)
+            }
+            return PendingPaste(
+                ticket: enqueueTransfer(sources, to: directory, move: true),
+                cutItems: valid,
+                cutSessionID: session.id,
+                preliminaryIssues: staleIssues
+            )
         }
-        let copied = NSPasteboard.general.readObjects(
+
+        // An all-stale SuperRightClick cut session must not shadow the current
+        // system clipboard. Clear it and continue with ordinary copy/paste.
+        if let session {
+            _ = compareAndSetCutSession(expectedID: session.id, replacementItems: [])
+        } else if hasLegacyCutState {
+            clearCutState()
+        }
+        let copied = pasteboard.readObjects(
             forClasses: [NSURL.self],
             options: [.urlReadingFileURLsOnly: true]
         ) as? [URL] ?? []
         guard !copied.isEmpty else {
-            return showError(t("剪贴板中没有可粘贴的文件。"))
+            showError(t("剪贴板中没有可粘贴的文件。"))
+            return nil
         }
-        transfer(copied, to: directory, move: false)
+        let sources = copied.map {
+            TransferSource(
+                url: $0,
+                expectedIdentity: nil,
+                restoreVisibilityAfterMove: false
+            )
+        }
+        return PendingPaste(
+            ticket: enqueueTransfer(sources, to: directory, move: false),
+            cutItems: nil,
+            cutSessionID: nil,
+            preliminaryIssues: []
+        )
     }
 
-    private var hiddenCutPaths: Set<String> {
-        Set(configurationDefaults.stringArray(forKey: "hiddenCutPaths") ?? [])
+    private func completePaste(_ pending: PendingPaste, result: TransferResult) {
+        if let cutItems = pending.cutItems, let sessionID = pending.cutSessionID {
+            let failedPaths = Set(result.failedSources.map { $0.standardizedFileURL.path })
+            let remaining = cutItems.filter {
+                failedPaths.contains($0.path) && $0.stillMatches()
+            }
+            // A Cut action performed while this paste was running owns a new
+            // session UUID. Never let this older completion erase it.
+            _ = compareAndSetCutSession(
+                expectedID: sessionID,
+                replacementItems: remaining
+            )
+        }
+        if !result.visibilityRestorationFailures.isEmpty {
+            let combined = loadPendingVisibilityRestorations()
+                + result.visibilityRestorationFailures
+            var seen = Set<CutItemSnapshot>()
+            savePendingVisibilityRestorations(combined.filter { seen.insert($0).inserted })
+            scheduleVisibilityRestorationRetry()
+        }
+        presentTransferResult(result, additionalIssues: pending.preliminaryIssues)
     }
 
-    private func restorePreviouslyHiddenCutItems() {
-        for path in hiddenCutPaths {
-            var url = URL(fileURLWithPath: path)
-            guard fileManager.fileExists(atPath: path) else { continue }
-            var values = URLResourceValues()
-            values.isHidden = false
-            try? url.setResourceValues(values)
+    private static let cutItemsKey = "cutItemSnapshotsV2"
+    private static let pendingVisibilityRestorationsKey = "pendingVisibilityRestorationsV2"
+    private static let legacyCutPathsKey = "cutPaths"
+    private static let legacyHiddenCutPathsKey = "hiddenCutPaths"
+
+    private var hasLegacyCutState: Bool {
+        !(configurationDefaults.stringArray(forKey: Self.legacyCutPathsKey) ?? []).isEmpty
+            || !(configurationDefaults.stringArray(
+                forKey: Self.legacyHiddenCutPathsKey
+            ) ?? []).isEmpty
+    }
+
+    static func hasPersistedCutItems(in defaults: UserDefaults = .standard) -> Bool {
+        guard let data = defaults.data(forKey: cutItemsKey) else {
+            return !(defaults.stringArray(forKey: legacyCutPathsKey) ?? []).isEmpty
         }
-        configurationDefaults.removeObject(forKey: "hiddenCutPaths")
+        if let session = try? JSONDecoder().decode(CutSession.self, from: data) {
+            return !session.items.isEmpty
+        }
+        // Backward compatibility with the initial V2 array representation.
+        return (try? JSONDecoder().decode([CutItemSnapshot].self, from: data).isEmpty) == false
+    }
+
+    private func loadCutSession() -> CutSession? {
+        guard let data = configurationDefaults.data(forKey: Self.cutItemsKey) else {
+            return nil
+        }
+        if let session = try? JSONDecoder().decode(CutSession.self, from: data),
+           !session.items.isEmpty {
+            return session
+        }
+        // Migrate the initial V2 array in-place. The UUID makes all subsequent
+        // asynchronous completion updates compare-and-set operations.
+        if let items = try? JSONDecoder().decode([CutItemSnapshot].self, from: data),
+           !items.isEmpty {
+            let session = CutSession(id: UUID(), items: items)
+            saveCutSession(session)
+            return session
+        }
+        return nil
+    }
+
+    private func saveCutSession(_ session: CutSession?) {
+        configurationDefaults.removeObject(forKey: Self.legacyCutPathsKey)
+        configurationDefaults.removeObject(forKey: Self.legacyHiddenCutPathsKey)
+        guard let session, !session.items.isEmpty else {
+            configurationDefaults.removeObject(forKey: Self.cutItemsKey)
+            return
+        }
+        if let data = try? JSONEncoder().encode(session) {
+            configurationDefaults.set(data, forKey: Self.cutItemsKey)
+        }
+    }
+
+    @discardableResult
+    private func compareAndSetCutSession(
+        expectedID: UUID,
+        replacementItems: [CutItemSnapshot]
+    ) -> Bool {
+        guard let current = loadCutSession(), current.id == expectedID else {
+            return false
+        }
+        saveCutSession(
+            replacementItems.isEmpty
+                ? nil
+                : CutSession(id: expectedID, items: replacementItems)
+        )
+        return true
+    }
+
+    private func clearCutState() {
+        configurationDefaults.removeObject(forKey: Self.cutItemsKey)
+        configurationDefaults.removeObject(forKey: Self.legacyCutPathsKey)
+        configurationDefaults.removeObject(forKey: Self.legacyHiddenCutPathsKey)
+    }
+
+    private func loadPendingVisibilityRestorations() -> [CutItemSnapshot] {
+        guard let data = configurationDefaults.data(
+            forKey: Self.pendingVisibilityRestorationsKey
+        ), let items = try? JSONDecoder().decode([CutItemSnapshot].self, from: data) else {
+            return []
+        }
+        return items
+    }
+
+    private func savePendingVisibilityRestorations(_ items: [CutItemSnapshot]) {
+        guard !items.isEmpty else {
+            configurationDefaults.removeObject(forKey: Self.pendingVisibilityRestorationsKey)
+            return
+        }
+        if let data = try? JSONEncoder().encode(items) {
+            configurationDefaults.set(data, forKey: Self.pendingVisibilityRestorationsKey)
+        }
+    }
+
+    /// Visibility restoration failures are recoverable (for example, a volume
+    /// can be briefly unavailable). Retry quietly while this extension instance
+    /// remains alive instead of waiting for the user to perform another Cut.
+    private func scheduleVisibilityRestorationRetry() {
+        visibilityRestorationRetryTask?.cancel()
+        visibilityRestorationRetryTask = Task { @MainActor [weak self] in
+            for delay in [1, 5, 30] {
+                do {
+                    try await Task.sleep(for: .seconds(delay))
+                } catch {
+                    return
+                }
+                guard let self else { return }
+                if self.retryPendingVisibilityRestorations() { break }
+            }
+            self?.visibilityRestorationRetryTask = nil
+        }
+    }
+
+    @discardableResult
+    private func retryPendingVisibilityRestorations() -> Bool {
+        var unresolved: [CutItemSnapshot] = []
+        for snapshot in loadPendingVisibilityRestorations() where snapshot.stillMatches() {
+            do {
+                try Self.setHidden(false, at: snapshot.url)
+            } catch {
+                unresolved.append(snapshot)
+            }
+        }
+        savePendingVisibilityRestorations(unresolved)
+        return unresolved.isEmpty
+    }
+
+    @discardableResult
+    private func restorePreviouslyHiddenCutItems() -> Bool {
+        var issues: [String] = []
+        let session = loadCutSession()
+        let candidates = (session?.items ?? []).filter(\.wasTemporarilyHidden)
+            + loadPendingVisibilityRestorations()
+        var unresolved: [CutItemSnapshot] = []
+        for snapshot in candidates where snapshot.stillMatches() {
+            do {
+                try Self.setHidden(false, at: snapshot.url)
+            } catch {
+                issues.append(f("%@：%@", snapshot.url.lastPathComponent, errorText(error)))
+                unresolved.append(snapshot)
+            }
+        }
+        // Legacy path-only state cannot be restored safely: the path may now
+        // name an unrelated item. It is cleared without touching that entry.
+        if let session {
+            _ = compareAndSetCutSession(expectedID: session.id, replacementItems: [])
+        } else {
+            clearCutState()
+        }
+        savePendingVisibilityRestorations(unresolved)
+        if !unresolved.isEmpty { scheduleVisibilityRestorationRetry() }
+        if !issues.isEmpty { showError(issues.joined(separator: "\n")) }
+        return unresolved.isEmpty
     }
 
     func createSameNameFolders(for urls: [URL]) {
@@ -849,30 +1803,83 @@ final class FeatureCoordinator {
 
     func addCommonDirectory(_ url: URL) {
         let normalized = PathSafety.standardized(url)
-        guard !configuration.commonDirectories.contains(where: {
-            PathSafety.standardized($0.resolvedURL) == normalized
-        }) else { return showInfo(t("该目录已在常用目录中。")) }
-        configuration.commonDirectories.append(
-            DirectoryShortcut(name: url.lastPathComponent, path: url.path)
-        )
-        persistConfiguration()
-        showInfo(t("已添加到常用目录。"))
+        var workingSnapshot = configurationSnapshot
+        var proposedBase = configuration
+        for _ in 0..<2 {
+            guard !proposedBase.commonDirectories.contains(where: {
+                PathSafety.standardized($0.resolvedURL) == normalized
+            }) else {
+                configuration = proposedBase
+                if proposedBase == workingSnapshot.configuration {
+                    configurationSnapshot = workingSnapshot
+                }
+                return showInfo(t("该目录已在常用目录中。"))
+            }
+            var proposed = proposedBase
+            proposed.commonDirectories.append(
+                DirectoryShortcut(name: url.lastPathComponent, path: url.path)
+            )
+            let result = ConfigurationStore.save(
+                proposed,
+                basedOn: workingSnapshot,
+                defaults: configurationDefaults,
+                publish: publishChanges
+            )
+            if let committed = result.committedSnapshot {
+                configurationSnapshot = committed
+                configuration = committed.configuration
+                showInfo(t("已添加到常用目录。"))
+                return
+            }
+            if case let .conflict(latest?) = result {
+                workingSnapshot = latest
+                proposedBase = latest.configuration
+                continue
+            }
+            break
+        }
+        let latest = ConfigurationStore.loadSnapshot(defaults: configurationDefaults)
+        if latest.isAuthoritative {
+            configurationSnapshot = latest
+            configuration = latest.configuration
+        } else if configurationDefaults === UserDefaults.standard {
+            ConfigurationStore.requestAppConfiguration()
+        }
+        showError(t("配置已被其他进程更新，请重试。"))
     }
 
     // MARK: - B05/B06/B07/B08
 
     func setFolderIcon(_ folder: URL) {
-        let panel = NSOpenPanel()
-        panel.title = t("选择文件夹图标图片")
-        panel.allowedContentTypes = [.image]
-        panel.canChooseDirectories = false
-        panel.allowsMultipleSelection = false
-        guard panel.runModal() == .OK, let imageURL = panel.url,
-              let image = NSImage(contentsOf: imageURL) else { return }
-        if !NSWorkspace.shared.setIcon(image, forFile: folder.path, options: []) {
-            showError(t("Finder 未能设置文件夹图标。"))
-        } else {
-            playOperationSound()
+        guard let folderIdentity = FileIdentity.capture(at: folder),
+              folderIdentity.fileType == UInt32(S_IFDIR) else {
+            showError(t("所选文件夹已不存在或无法访问。"))
+            return
+        }
+        Task { @MainActor [weak self] in
+            guard let self,
+                  let bookmark = await self.requestTransferDestination(
+                      operation: .selectFolderIconImage,
+                      sourceItemCount: 1
+                  ) else { return }
+            do {
+                let resolution = try TransferDestinationPickerBridge
+                    .resolveEphemeralBookmark(bookmark)
+                let imageURL = resolution.url
+                defer { imageURL.stopAccessingSecurityScopedResource() }
+                guard let image = NSImage(contentsOf: imageURL) else {
+                    throw OperationFailure(description: "无法读取所选图标图片。")
+                }
+                guard folderIdentity.matchesEntry(at: folder) else {
+                    throw OperationFailure(description: "文件夹在选择图片期间已被替换，未设置图标。")
+                }
+                if !NSWorkspace.shared.setIcon(image, forFile: folder.path, options: []) {
+                    throw OperationFailure(description: "Finder 未能设置文件夹图标。")
+                }
+                self.playOperationSound()
+            } catch {
+                self.showError(self.errorText(error))
+            }
         }
     }
 
@@ -888,7 +1895,7 @@ final class FeatureCoordinator {
             alert.messageText = t("文件信息与摘要")
             alert.informativeText = lines.joined(separator: "\n")
             alert.addButton(withTitle: t("完成"))
-            alert.runModal()
+            self.runModalInFront(alert)
         }
     }
 
@@ -1013,12 +2020,46 @@ final class FeatureCoordinator {
                 .map { isDirectoryTarget($0) ? $0 : $0.deletingLastPathComponent() }
                 .filter { seen.insert($0.path).inserted }
         }
-        guard !targets.isEmpty else { return }
+        var preliminaryIssues: [String] = []
+        targets = targets.filter { target in
+            guard FileIdentity.capture(at: target) != nil else {
+                preliminaryIssues.append(f(
+                    "%@：目标已不存在或无法访问。",
+                    target.lastPathComponent
+                ))
+                return false
+            }
+            return true
+        }
+        guard !targets.isEmpty else {
+            if !preliminaryIssues.isEmpty {
+                showError(preliminaryIssues.joined(separator: "\n"))
+            }
+            return
+        }
+        let language = configuration.language
+        let appName = appURL.deletingPathExtension().lastPathComponent
         NSWorkspace.shared.open(
             targets,
             withApplicationAt: appURL,
             configuration: NSWorkspace.OpenConfiguration()
-        ) { _, _ in }
+        ) { [weak self] _, error in
+            let launchIssue = error.map {
+                Localizer.format(
+                    "无法使用“%@”打开所选项目：%@",
+                    language: language,
+                    appName,
+                    Self.errorText($0, language: language)
+                )
+            }
+            Task { @MainActor in
+                guard let self else { return }
+                let issues = preliminaryIssues + (launchIssue.map { [$0] } ?? [])
+                if !issues.isEmpty {
+                    self.showError(issues.joined(separator: "\n"))
+                }
+            }
+        }
     }
 
     private func isDirectoryTarget(_ url: URL) -> Bool {
@@ -1072,17 +2113,63 @@ final class FeatureCoordinator {
     }
 
     func grantWritePermission(_ urls: [URL]) {
+        guard !urls.isEmpty else { return }
         guard urls.allSatisfy({ !PathSafety.isProtected($0) }) else {
             return showError(t("所选内容包含受保护路径。"))
         }
-        let preview = urls.compactMap { url -> String? in
-            guard let attributes = try? fileManager.attributesOfItem(atPath: url.path),
-                  let number = attributes[.posixPermissions] as? NSNumber else { return nil }
-            let current = number.intValue
-            return f(
+        struct PermissionTarget {
+            let url: URL
+            let descriptor: Int32
+            let identity: FileIdentity
+            let permissions: mode_t
+        }
+
+        var targets: [PermissionTarget] = []
+        var failures: [String] = []
+        defer { targets.forEach { _ = close($0.descriptor) } }
+
+        for input in urls {
+            let url = input.standardizedFileURL
+            let descriptor = url.path.withCString {
+                open($0, O_RDONLY | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC)
+            }
+            guard descriptor >= 0 else {
+                failures.append(f(
+                    "%@：无法安全打开所选项目（POSIX 错误 %@）。",
+                    url.lastPathComponent,
+                    String(errno)
+                ))
+                continue
+            }
+            var status = stat()
+            guard fstat(descriptor, &status) == 0 else {
+                let code = errno
+                _ = close(descriptor)
+                failures.append(f(
+                    "%@：无法读取所选项目身份（POSIX 错误 %@）。",
+                    url.lastPathComponent,
+                    String(code)
+                ))
+                continue
+            }
+            targets.append(PermissionTarget(
+                url: url,
+                descriptor: descriptor,
+                identity: FileIdentity(status: status),
+                permissions: status.st_mode & 0o7777
+            ))
+        }
+
+        guard !targets.isEmpty else {
+            if !failures.isEmpty { showError(failures.joined(separator: "\n")) }
+            return
+        }
+        let preview = targets.map { target in
+            f(
                 "%@：%@",
-                url.lastPathComponent,
-                "\(String(current, radix: 8)) → \(String(current | 0o200, radix: 8))"
+                target.url.lastPathComponent,
+                "\(String(target.permissions, radix: 8)) → "
+                    + "\(String(target.permissions | mode_t(S_IWUSR), radix: 8))"
             )
         }
         guard confirm(
@@ -1090,73 +2177,193 @@ final class FeatureCoordinator {
             message: f("只会为当前用户增加写入权限：\n%@", preview.joined(separator: "\n"))
         )
         else { return }
-        for url in urls {
-            do {
-                let attributes = try fileManager.attributesOfItem(atPath: url.path)
-                let current = (attributes[.posixPermissions] as? NSNumber)?.intValue ?? 0o444
-                try fileManager.setAttributes(
-                    [.posixPermissions: NSNumber(value: current | 0o200)],
-                    ofItemAtPath: url.path
-                )
-            } catch {
-                showError(f(
+        var changedCount = 0
+        for target in targets {
+            var status = stat()
+            guard fstat(target.descriptor, &status) == 0,
+                  FileIdentity(status: status) == target.identity,
+                  target.identity.matchesEntry(at: target.url) else {
+                failures.append(f(
                     "%@：%@",
-                    url.lastPathComponent,
-                    errorText(error)
+                    target.url.lastPathComponent,
+                    t("所选项目在确认期间已被替换，未修改权限。")
                 ))
+                continue
             }
+            let permissions = status.st_mode & 0o7777
+            guard fchmod(target.descriptor, permissions | mode_t(S_IWUSR)) == 0 else {
+                failures.append(f(
+                    "%@：无法修改权限（POSIX 错误 %@）。",
+                    target.url.lastPathComponent,
+                    String(errno)
+                ))
+                continue
+            }
+            changedCount += 1
         }
-        playOperationSound()
+        if failures.isEmpty {
+            if changedCount > 0 { playOperationSound() }
+        } else {
+            showError(failures.joined(separator: "\n"))
+        }
     }
 
     func dissolve(_ folder: URL) {
-        guard !PathSafety.isProtected(folder) else {
-            return showError(t("不能解散受保护目录。"))
-        }
-        do {
-            let parent = folder.deletingLastPathComponent()
-            let children = try fileManager.contentsOfDirectory(
-                at: folder,
-                includingPropertiesForKeys: nil
-            )
-            let conflicts = children.filter {
-                fileManager.fileExists(atPath: parent.appendingPathComponent($0.lastPathComponent).path)
-            }
-            guard conflicts.isEmpty else {
-                return showError(f(
-                    "上级目录存在同名项目：\n%@",
-                    conflicts.map(\.lastPathComponent).joined(separator: "\n")
-                ))
-            }
-            guard confirm(
-                title: t("解散文件夹"),
-                message: f(
-                    "将移动 %@ 个项目到上级目录并删除“%@”。",
-                    String(children.count),
-                    folder.lastPathComponent
-                )
-            ) else { return }
-            var moved: [(from: URL, to: URL)] = []
-            do {
-                for child in children {
-                    let destination = parent.appendingPathComponent(child.lastPathComponent)
-                    try fileManager.moveItem(at: child, to: destination)
-                    moved.append((child, destination))
-                }
-                try fileManager.removeItem(at: folder)
-                playOperationSound()
-            } catch {
-                for item in moved.reversed() {
-                    try? fileManager.moveItem(at: item.to, to: item.from)
-                }
-                throw error
-            }
-        } catch {
-            showError(errorText(error))
+        guard let ticket = prepareDissolve(folder) else { return }
+        Task { @MainActor [weak self] in
+            let result = await ticket.value()
+            self?.presentDissolveResult(result)
         }
     }
 
-    private struct DeletionTargetSnapshot {
+    func dissolveAndWait(_ folder: URL) async {
+        guard let ticket = prepareDissolve(folder) else { return }
+        presentDissolveResult(await ticket.value())
+    }
+
+    private func prepareDissolve(_ input: URL) -> FileOperationTicket<DissolveResult>? {
+        let folder = input.standardizedFileURL
+        guard !PathSafety.isProtected(folder) else {
+            showError(t("不能解散受保护目录。"))
+            return nil
+        }
+        guard let identity = FileIdentity.capture(at: folder),
+              identity.fileType == UInt32(S_IFDIR) else {
+            showError(f("%@：目标已不存在或无法访问。", folder.lastPathComponent))
+            return nil
+        }
+        guard confirm(
+            title: t("解散文件夹"),
+            message: f(
+                "将移动文件夹中的项目到上级目录并删除“%@”。",
+                folder.lastPathComponent
+            )
+        ) else { return nil }
+
+        let fileManager = backgroundFileManager
+        let language = configuration.language
+        return fileOperationWorker.enqueue {
+            Self.performDissolve(
+                folder,
+                expectedIdentity: identity,
+                fileManager: fileManager.value,
+                language: language
+            )
+        }
+    }
+
+    nonisolated private static func performDissolve(
+        _ folder: URL,
+        expectedIdentity: FileIdentity,
+        fileManager: FileManager,
+        language: AppLanguage
+    ) -> DissolveResult {
+        func issue(_ url: URL, _ error: Error) -> FileOperationIssue {
+            FileOperationIssue(
+                url: url,
+                message: Localizer.format(
+                    "%@：%@",
+                    language: language,
+                    url.lastPathComponent,
+                    errorText(error, language: language)
+                )
+            )
+        }
+
+        guard !PathSafety.isProtected(folder), expectedIdentity.matchesEntry(at: folder) else {
+            return DissolveResult(
+                didDissolve: false,
+                issues: [FileOperationIssue(
+                    url: folder,
+                    message: Localizer.format(
+                        "%@：目标已不存在或无法访问。",
+                        language: language,
+                        folder.lastPathComponent
+                    )
+                )]
+            )
+        }
+
+        let parent = folder.deletingLastPathComponent()
+        let children: [URL]
+        do {
+            children = try fileManager.contentsOfDirectory(
+                at: folder,
+                includingPropertiesForKeys: nil
+            )
+        } catch {
+            return DissolveResult(didDissolve: false, issues: [issue(folder, error)])
+        }
+        let conflicts = children.filter {
+            FileIdentity.capture(
+                at: parent.appendingPathComponent($0.lastPathComponent)
+            ) != nil
+        }
+        guard conflicts.isEmpty else {
+            return DissolveResult(
+                didDissolve: false,
+                issues: [FileOperationIssue(
+                    url: folder,
+                    message: Localizer.format(
+                        "上级目录存在同名项目：\n%@",
+                        language: language,
+                        conflicts.map(\.lastPathComponent).joined(separator: "\n")
+                    )
+                )]
+            )
+        }
+
+        var moved: [(from: URL, to: URL)] = []
+        do {
+            for child in children {
+                guard expectedIdentity.matchesEntry(at: folder) else {
+                    throw OperationFailure(description: "目标已不存在或无法访问。")
+                }
+                let destination = parent.appendingPathComponent(child.lastPathComponent)
+                try fileManager.moveItem(at: child, to: destination)
+                moved.append((child, destination))
+            }
+            guard expectedIdentity.matchesEntry(at: folder) else {
+                throw OperationFailure(description: "目标已不存在或无法访问。")
+            }
+            // `FileManager.removeItem` recursively deletes a directory. A new
+            // child created after enumeration would therefore be lost. rmdir
+            // removes only the now-empty directory and safely fails otherwise.
+            let removeResult = folder.path.withCString { rmdir($0) }
+            guard removeResult == 0 else {
+                throw SecureFileFailure.posix("无法删除已解散文件夹", errno)
+            }
+            return DissolveResult(didDissolve: true, issues: [])
+        } catch {
+            var issues = [issue(folder, error)]
+            for item in moved.reversed() {
+                do {
+                    try fileManager.moveItem(at: item.to, to: item.from)
+                } catch {
+                    issues.append(FileOperationIssue(
+                        url: item.to,
+                        message: Localizer.format(
+                            "无法回滚“%@”：%@",
+                            language: language,
+                            item.to.lastPathComponent,
+                            errorText(error, language: language)
+                        )
+                    ))
+                }
+            }
+            return DissolveResult(didDissolve: false, issues: issues)
+        }
+    }
+
+    private func presentDissolveResult(_ result: DissolveResult) {
+        if result.issues.isEmpty {
+            if result.didDissolve { playOperationSound() }
+        } else {
+            showError(result.issues.map(\.message).joined(separator: "\n"))
+        }
+    }
+
+    private struct DeletionTargetSnapshot: Sendable {
         let url: URL
         let path: String
         let resolvedPath: String
@@ -1187,7 +2394,19 @@ final class FeatureCoordinator {
             guard revalidateDeletionTargets(targets) else { return }
         }
 
-        executePermanentDeletion(targets)
+        // Test-only race hook remains on MainActor. Production is nil. The
+        // worker performs one final identity check before its atomic rename.
+        for target in targets {
+            permanentDeletionWillIsolate?(target.url)
+        }
+        let language = configuration.language
+        let result = await fileOperationWorker.enqueue {
+            Self.executePermanentDeletion(
+                targets,
+                language: language
+            )
+        }.value()
+        presentDeletionResult(result)
     }
 
     private func captureDeletionTargets(_ urls: [URL]) -> [DeletionTargetSnapshot]? {
@@ -1237,29 +2456,60 @@ final class FeatureCoordinator {
         return true
     }
 
-    private func executePermanentDeletion(_ targets: [DeletionTargetSnapshot]) {
-        var deleted = false
-        for target in targets where isolateAndDelete(target) {
-            deleted = true
+    nonisolated private static func executePermanentDeletion(
+        _ targets: [DeletionTargetSnapshot],
+        language: AppLanguage
+    ) -> DeletionResult {
+        var deletedCount = 0
+        var issues: [FileOperationIssue] = []
+        for target in targets {
+            if let issue = isolateAndDelete(
+                target,
+                language: language
+            ) {
+                issues.append(issue)
+            } else {
+                deletedCount += 1
+            }
         }
-        if deleted { playOperationSound() }
+        return DeletionResult(deletedCount: deletedCount, issues: issues)
+    }
+
+    private func presentDeletionResult(_ result: DeletionResult) {
+        if result.issues.isEmpty {
+            if result.deletedCount > 0 { playOperationSound() }
+        } else {
+            showError(result.issues.map(\.message).joined(separator: "\n"))
+        }
     }
 
     /// 将目标以不可覆盖的原子 rename 移到同一父目录的随机隔离名，再复核
     /// device/inode/type 后删除隔离项。rename 是提交线性化点：原公开路径随后
     /// 即使被创建同名新对象，也不会成为本次删除对象。
-    private func isolateAndDelete(_ target: DeletionTargetSnapshot) -> Bool {
+    nonisolated private static func isolateAndDelete(
+        _ target: DeletionTargetSnapshot,
+        language: AppLanguage
+    ) -> FileOperationIssue? {
+        func failure(_ key: String, _ arguments: String...) -> FileOperationIssue {
+            FileOperationIssue(
+                url: target.url,
+                message: Localizer.format(
+                    key,
+                    language: language,
+                    arguments: arguments.map { $0 as CVarArg }
+                )
+            )
+        }
         let parentURL = target.url.deletingLastPathComponent()
         let originalName = target.url.lastPathComponent
         let parentDescriptor = parentURL.path.withCString {
             open($0, O_RDONLY | O_DIRECTORY | O_CLOEXEC)
         }
         guard parentDescriptor >= 0 else {
-            showError(f(
+            return failure(
                 "无法打开永久删除目标目录（POSIX 错误 %@）。",
                 String(errno)
-            ))
-            return false
+            )
         }
         defer { _ = close(parentDescriptor) }
 
@@ -1269,12 +2519,8 @@ final class FeatureCoordinator {
         }
         guard immediateResult == 0,
               deletionIdentity(immediateStatus, matches: target) else {
-            showError(t("永久删除目标在提交期间已被替换，已取消操作。"))
-            return false
+            return failure("永久删除目标在提交期间已被替换，已取消操作。")
         }
-
-        // 仅用于确定性竞态测试；生产配置恒为 nil。
-        permanentDeletionWillIsolate?(target.url)
 
         var isolatedName: String?
         var isolationFailure: Int32?
@@ -1303,14 +2549,13 @@ final class FeatureCoordinator {
 
         guard let isolatedName else {
             if let isolationFailure {
-                showError(f(
+                return failure(
                     "无法安全隔离永久删除目标（POSIX 错误 %@）。",
                     String(isolationFailure)
-                ))
+                )
             } else {
-                showError(t("无法生成唯一的永久删除隔离路径。"))
+                return failure("无法生成唯一的永久删除隔离路径。")
             }
-            return false
         }
 
         let isolatedURL = parentURL.appendingPathComponent(isolatedName)
@@ -1332,37 +2577,282 @@ final class FeatureCoordinator {
                 }
             }
             if restoreResult == 0 {
-                showError(t("永久删除目标身份复核失败，已恢复原路径并取消操作。"))
+                return failure("永久删除目标身份复核失败，已恢复原路径并取消操作。")
             } else {
-                showError(f(
+                return failure(
                     "永久删除目标身份复核失败，且无法恢复原路径；项目保留在 %@（POSIX 错误 %@）。",
                     isolatedURL.path,
                     String(errno)
-                ))
+                )
             }
-            return false
         }
 
         do {
-            try fileManager.removeItem(at: isolatedURL)
+            // Keep the final recursive removal anchored to the already-open
+            // parent directory. Replacing or renaming the parent's public path
+            // after isolation can no longer redirect deletion elsewhere.
+            try removeEntryRecursively(
+                named: isolatedName,
+                from: parentDescriptor
+            )
         } catch {
-            showError(f(
+            return failure(
                 "无法删除已隔离的永久删除目标；剩余项目位于 %@：%@",
                 isolatedURL.path,
-                errorText(error)
-            ))
-            return false
+                errorText(error, language: language)
+            )
         }
-        return true
+        return nil
     }
 
-    private func deletionIdentity(
+    /// Recursively removes a directory entry using only `*at` operations rooted
+    /// at stable descriptors. Symlinks are always unlinked as entries and are
+    /// never traversed. On concurrent modification, the operation fails closed
+    /// and leaves the remaining isolated tree for manual recovery.
+    nonisolated private static func removeEntryRecursively(
+        named name: String,
+        from parentDescriptor: Int32
+    ) throws {
+        var status = stat()
+        guard name.withCString({
+            fstatat(parentDescriptor, $0, &status, AT_SYMLINK_NOFOLLOW)
+        }) == 0 else {
+            throw OperationFailure(
+                "无法读取隔离项目（POSIX 错误 %@）。",
+                arguments: [String(errno)]
+            )
+        }
+
+        if status.st_mode & S_IFMT != S_IFDIR {
+            guard name.withCString({ unlinkat(parentDescriptor, $0, 0) }) == 0 else {
+                throw OperationFailure(
+                    "无法删除隔离项目（POSIX 错误 %@）。",
+                    arguments: [String(errno)]
+                )
+            }
+            return
+        }
+
+        let childDescriptor = name.withCString {
+            openat(
+                parentDescriptor,
+                $0,
+                O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC
+            )
+        }
+        guard childDescriptor >= 0 else {
+            throw OperationFailure(
+                "无法打开隔离目录（POSIX 错误 %@）。",
+                arguments: [String(errno)]
+            )
+        }
+        var openedStatus = stat()
+        guard fstat(childDescriptor, &openedStatus) == 0,
+              openedStatus.st_dev == status.st_dev,
+              openedStatus.st_ino == status.st_ino,
+              openedStatus.st_mode & S_IFMT == S_IFDIR else {
+            let code = errno
+            _ = close(childDescriptor)
+            throw OperationFailure(
+                "隔离目录身份已变化（POSIX 错误 %@）。",
+                arguments: [String(code)]
+            )
+        }
+        guard let directory = fdopendir(childDescriptor) else {
+            let code = errno
+            _ = close(childDescriptor)
+            throw OperationFailure(
+                "无法读取隔离目录（POSIX 错误 %@）。",
+                arguments: [String(code)]
+            )
+        }
+
+        var removalError: Error?
+        errno = 0
+        while let entry = readdir(directory) {
+            let entryName = withUnsafePointer(to: entry.pointee.d_name) { pointer in
+                pointer.withMemoryRebound(to: CChar.self, capacity: Int(NAME_MAX) + 1) {
+                    String(cString: $0)
+                }
+            }
+            if entryName == "." || entryName == ".." { continue }
+            do {
+                try removeEntryRecursively(named: entryName, from: childDescriptor)
+            } catch {
+                removalError = error
+                break
+            }
+            errno = 0
+        }
+        let enumerationError = errno
+        _ = closedir(directory) // closes childDescriptor
+
+        if let removalError { throw removalError }
+        guard enumerationError == 0 else {
+            throw OperationFailure(
+                "读取隔离目录时失败（POSIX 错误 %@）。",
+                arguments: [String(enumerationError)]
+            )
+        }
+        guard name.withCString({
+            unlinkat(parentDescriptor, $0, AT_REMOVEDIR)
+        }) == 0 else {
+            throw OperationFailure(
+                "无法删除隔离目录（POSIX 错误 %@）。",
+                arguments: [String(errno)]
+            )
+        }
+    }
+
+    nonisolated private static func deletionIdentity(
         _ status: stat,
         matches target: DeletionTargetSnapshot
     ) -> Bool {
         status.st_dev == target.device
             && status.st_ino == target.inode
             && status.st_mode & S_IFMT == target.fileType
+    }
+
+    private func requestTransferDestination(
+        operation: TransferDestinationOperation,
+        sourceItemCount: Int
+    ) async -> Data? {
+        guard let hostURL = Self.containingHostApplicationURL() else {
+            showError(t("无法定位宿主应用，请确认扩展已正确嵌入 App 包内。"))
+            return nil
+        }
+        guard let expectedHostCodeHash = HostCodeIdentity.codeHash(at: hostURL) else {
+            showError(t("无法验证宿主应用的代码签名。"))
+            return nil
+        }
+
+        let socketPath = AuthenticatedHostResponseServer<
+            TransferDestinationPickerResponse
+        >.makeSocketPath()
+        let request = TransferDestinationPickerBridge.makeRequest(
+            operation: operation,
+            sourceItemCount: sourceItemCount,
+            replySocketPath: socketPath
+        )
+        let server: AuthenticatedHostResponseServer<TransferDestinationPickerResponse>
+        do {
+            server = try AuthenticatedHostResponseServer(
+                socketPath: socketPath,
+                requestID: request.id,
+                expectedHostCodeHash: expectedHostCodeHash,
+                expectedRequestDigest: request.authenticationDigest,
+                maximumResponseSize: TransferDestinationPickerBridge.maximumBookmarkSize + 64 * 1024
+            )
+        } catch {
+            showError(t("无法建立目录选择通道：\(error.localizedDescription)"))
+            return nil
+        }
+        defer { server.invalidate() }
+
+        let requestURL: URL
+        do {
+            requestURL = try TransferDestinationPickerBridge.writeRequest(request)
+        } catch {
+            showError(t("无法写入目录选择请求：\(error.localizedDescription)"))
+            return nil
+        }
+        defer { TransferDestinationPickerBridge.removeRequest(at: requestURL) }
+
+        Self.launchOrActivateHostForTransferDestination(
+            at: hostURL,
+            requestURL: requestURL
+        )
+        TransferDestinationPickerBridge.postRequest(at: requestURL)
+
+        let remaining = TransferDestinationPickerBridge.remainingResponseLifetime(for: request)
+        guard remaining > 0 else { return nil }
+        let timeoutMilliseconds = Int64((remaining * 1_000).rounded(.down))
+        let response: TransferDestinationPickerResponse? = await withTaskGroup(
+            of: TransferDestinationPickerResponse?.self
+        ) { group in
+            group.addTask {
+                await Task.detached(priority: .userInitiated) {
+                    server.receiveResponse()
+                }.value
+            }
+            group.addTask {
+                do {
+                    try await Task.sleep(for: .milliseconds(timeoutMilliseconds))
+                } catch {
+                    return nil
+                }
+                // Task cancellation cannot interrupt the synchronous poll loop;
+                // close the listener so the receive child is guaranteed to exit.
+                server.invalidate()
+                return nil
+            }
+            group.addTask {
+                var delay = 150
+                while !Task.isCancelled {
+                    do {
+                        try await Task.sleep(for: .milliseconds(delay))
+                    } catch { break }
+                    TransferDestinationPickerBridge.postRequest(at: requestURL)
+                    delay = min(delay * 2, 5_000)
+                }
+                return nil
+            }
+
+            let first = await group.next() ?? nil
+            server.invalidate()
+            group.cancelAll()
+            return first
+        }
+
+        guard let response else {
+            showError(t(
+                "目录选择超时或宿主应用未响应，请确认 SuperRightClick 主应用已运行。"
+            ))
+            return nil
+        }
+        guard TransferDestinationPickerBridge.remainingResponseLifetime(for: request) > 0,
+              response.isStructurallyValid else {
+            showError(t("目录选择响应无效或已过期，请重试。"))
+            return nil
+        }
+        switch response.outcome {
+        case .selected:
+            return response.destinationBookmark
+        case .cancelled:
+            return nil
+        case .failed:
+            showError(t("主应用无法保存所选文件夹的访问权限，请重新选择。"))
+            return nil
+        }
+    }
+
+    private static func launchOrActivateHostForTransferDestination(
+        at hostURL: URL,
+        requestURL: URL
+    ) {
+        let expectedURL = hostURL.standardizedFileURL.resolvingSymlinksInPath()
+        let runningApplications = NSRunningApplication.runningApplications(
+            withBundleIdentifier: RenameRequestBridge.hostBundleIdentifier
+        )
+        if let runningHost = runningApplications.first(where: {
+            $0.bundleURL?.standardizedFileURL.resolvingSymlinksInPath() == expectedURL
+        }) {
+            _ = runningHost.activate(options: [.activateAllWindows])
+            return
+        }
+
+        let configuration = NSWorkspace.OpenConfiguration()
+        configuration.activates = true
+        configuration.addsToRecentItems = false
+        configuration.createsNewApplicationInstance = !runningApplications.isEmpty
+        configuration.arguments = [
+            TransferDestinationPickerBridge.launchArgument,
+            requestURL.path,
+        ]
+        NSWorkspace.shared.openApplication(
+            at: hostURL,
+            configuration: configuration
+        ) { _, _ in }
     }
 
     private func requestPermanentDeleteConfirmation(for urls: [URL]) async -> Bool {
@@ -1428,11 +2918,13 @@ final class FeatureCoordinator {
                 return nil
             }
             group.addTask {
+                var delay = 150
                 while !Task.isCancelled {
                     do {
-                        try await Task.sleep(for: .milliseconds(150))
+                        try await Task.sleep(for: .milliseconds(delay))
                     } catch { break }
                     DestructiveConfirmationBridge.postRequest(at: requestURL)
+                    delay = min(delay * 2, 5_000)
                 }
                 return nil
             }
@@ -1457,14 +2949,21 @@ final class FeatureCoordinator {
         at hostURL: URL,
         requestURL: URL
     ) {
-        let isHostRunning = !NSRunningApplication.runningApplications(
+        let expectedURL = hostURL.standardizedFileURL.resolvingSymlinksInPath()
+        let runningApplications = NSRunningApplication.runningApplications(
             withBundleIdentifier: RenameRequestBridge.hostBundleIdentifier
-        ).isEmpty
-        guard !isHostRunning else { return }
+        )
+        if let runningHost = runningApplications.first(where: {
+            $0.bundleURL?.standardizedFileURL.resolvingSymlinksInPath() == expectedURL
+        }) {
+            _ = runningHost.activate(options: [.activateAllWindows])
+            return
+        }
 
         let configuration = NSWorkspace.OpenConfiguration()
         configuration.activates = true
         configuration.addsToRecentItems = false
+        configuration.createsNewApplicationInstance = !runningApplications.isEmpty
         configuration.arguments = [
             DestructiveConfirmationBridge.launchArgument,
             requestURL.path,
@@ -1570,9 +3069,15 @@ final class FeatureCoordinator {
         fileManager: FileManager
     ) throws -> URL {
         guard let source = CGImageSourceCreateWithURL(sourceURL as CFURL, nil),
-              let image = CGImageSourceCreateImageAtIndex(source, 0, nil) else {
+              let sourceImage = CGImageSourceCreateImageAtIndex(source, 0, nil) else {
             throw OperationFailure(description: "无法读取图片。")
         }
+        let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil)
+            as? [CFString: Any]
+        let orientationRaw = (properties?[kCGImagePropertyOrientation] as? NSNumber)?
+            .uint32Value ?? CGImagePropertyOrientation.up.rawValue
+        let orientation = CGImagePropertyOrientation(rawValue: orientationRaw) ?? .up
+        let image = imageByApplyingMetadataOrientation(sourceImage, orientation: orientation)
         let outputDirectory = sourceURL.deletingLastPathComponent()
         let type: CFString
         switch format {
@@ -1610,6 +3115,9 @@ final class FeatureCoordinator {
             : image
         let options: [CFString: Any] = [
             kCGImageDestinationLossyCompressionQuality: max(0, min(1, quality)),
+            // Pixels have already been transformed. Explicitly reset metadata so
+            // readers do not rotate or mirror the converted image a second time.
+            kCGImagePropertyOrientation: CGImagePropertyOrientation.up.rawValue,
         ]
         CGImageDestinationAddImage(destination, outputImage, options as CFDictionary)
         guard CGImageDestinationFinalize(destination) else {
@@ -1700,6 +3208,34 @@ final class FeatureCoordinator {
         OperationFailure(key, arguments: [String(code)])
     }
 
+    nonisolated private static func imageByApplyingMetadataOrientation(
+        _ image: CGImage,
+        orientation: CGImagePropertyOrientation
+    ) -> CGImage {
+        guard orientation != .up else { return image }
+
+        let oriented = CIImage(cgImage: image).oriented(orientation)
+        let extent = oriented.extent.integral
+        guard !extent.isEmpty, !extent.isInfinite else { return image }
+        let normalized = oriented.transformed(by: CGAffineTransform(
+            translationX: -extent.minX,
+            y: -extent.minY
+        ))
+        let outputRect = CGRect(origin: .zero, size: extent.size)
+        let context = CIContext(options: [.cacheIntermediates: false])
+        let outputFormat: CIFormat = image.bitsPerComponent > 8 ? .RGBA16 : .RGBA8
+        if let colorSpace = image.colorSpace,
+           let rendered = context.createCGImage(
+               normalized,
+               from: outputRect,
+               format: outputFormat,
+               colorSpace: colorSpace
+           ) {
+            return rendered
+        }
+        return context.createCGImage(normalized, from: outputRect) ?? image
+    }
+
     nonisolated private static func flattenedForJPEG(
         _ image: CGImage,
         backgroundHex: String
@@ -1759,8 +3295,31 @@ final class FeatureCoordinator {
 
     // MARK: - Helpers
 
-    private func persistConfiguration() {
-        ConfigurationStore.save(configuration, defaults: configurationDefaults, publish: publishChanges)
+    /// Finder Sync should delegate complex UI to the containing app. The
+    /// destination picker does so above; these remaining legacy one-shot alerts
+    /// are explicitly promoted while they are migrated incrementally, preventing
+    /// them from opening behind Finder or on another Space.
+    private func prepareLegacyModalWindow(_ window: NSWindow) {
+        NSRunningApplication.current.activate(options: [.activateAllWindows])
+        NSApp.activate()
+        window.level = .modalPanel
+        window.collectionBehavior.formUnion([.moveToActiveSpace, .fullScreenAuxiliary])
+        window.hidesOnDeactivate = false
+        window.center()
+        window.makeKeyAndOrderFront(nil)
+        window.orderFrontRegardless()
+    }
+
+    @discardableResult
+    private func runModalInFront(_ alert: NSAlert) -> NSApplication.ModalResponse {
+        prepareLegacyModalWindow(alert.window)
+        return alert.runModal()
+    }
+
+    @discardableResult
+    private func runModalInFront(_ panel: NSOpenPanel) -> NSApplication.ModalResponse {
+        prepareLegacyModalWindow(panel)
+        return panel.runModal()
     }
 
     private func playOperationSound() {
@@ -1831,7 +3390,7 @@ final class FeatureCoordinator {
         let field = NSTextField(string: defaultValue)
         field.frame = NSRect(x: 0, y: 0, width: 280, height: 24)
         alert.accessoryView = field
-        return alert.runModal() == .alertFirstButtonReturn ? field.stringValue : nil
+        return runModalInFront(alert) == .alertFirstButtonReturn ? field.stringValue : nil
     }
 
     private func confirm(title: String, message: String) -> Bool {
@@ -1842,7 +3401,7 @@ final class FeatureCoordinator {
         alert.informativeText = message
         alert.addButton(withTitle: t("继续"))
         alert.addButton(withTitle: t("取消"))
-        return alert.runModal() == .alertFirstButtonReturn
+        return runModalInFront(alert) == .alertFirstButtonReturn
     }
 
     private func showInfo(_ message: String) {
@@ -1850,7 +3409,7 @@ final class FeatureCoordinator {
         alert.messageText = "SuperRightClick"
         alert.informativeText = message
         alert.addButton(withTitle: t("好"))
-        alert.runModal()
+        runModalInFront(alert)
     }
 
     private func showError(_ message: String) {
@@ -1863,6 +3422,6 @@ final class FeatureCoordinator {
         alert.messageText = t("操作失败")
         alert.informativeText = message
         alert.addButton(withTitle: t("好"))
-        alert.runModal()
+        runModalInFront(alert)
     }
 }

@@ -34,8 +34,8 @@ final class FinderSync: FIFinderSync, @unchecked Sendable {
     private func configure() {
         let hadConfiguration = ConfigurationStore.hasStoredConfiguration()
         controller.directoryURLs = [UserPaths.homeDirectory]
-        observers.addDistributed(ConfigurationStore.observeUpdates { [weak self] value in
-            self?.coordinator.updateConfiguration(value)
+        observers.addDistributed(ConfigurationStore.observeSnapshotUpdates { [weak self] snapshot in
+            self?.coordinator.updateConfiguration(snapshot)
         })
         observers.addDistributed(ConfigurationStore.observeExtensionRequests())
         observers.addDistributed(
@@ -173,9 +173,15 @@ final class FinderSync: FIFinderSync, @unchecked Sendable {
                 move: command.action == .moveToDirectory
             )
         case .chooseMoveDirectory:
-            coordinator.chooseTransferDestination(for: urls, move: true)
+            let sources = urls
+            Task { @MainActor [weak self] in
+                await self?.coordinator.chooseTransferDestination(for: sources, move: true)
+            }
         case .chooseCopyDirectory:
-            coordinator.chooseTransferDestination(for: urls, move: false)
+            let sources = urls
+            Task { @MainActor [weak self] in
+                await self?.coordinator.chooseTransferDestination(for: sources, move: false)
+            }
         case .fileInfo:
             coordinator.showFileInfo(urls)
         case .setFolderIcon:
@@ -267,7 +273,7 @@ final class FinderSync: FIFinderSync, @unchecked Sendable {
 
     @MainActor
     private func hasPasteItems() -> Bool {
-        if !(UserDefaults.standard.stringArray(forKey: "cutPaths") ?? []).isEmpty {
+        if FeatureCoordinator.hasPersistedCutItems() {
             return true
         }
         return NSPasteboard.general.canReadObject(

@@ -5,10 +5,25 @@ ROOT_DIR="${0:A:h:h}"
 BUILD_DIR="$ROOT_DIR/build"
 APP_PATH="$BUILD_DIR/Build/Products/Release/SuperRightClick.app"
 EXTENSION_PATH="$APP_PATH/Contents/PlugIns/SuperRightClickFinder.appex"
+STANDALONE_EXTENSION_PATH="$BUILD_DIR/Build/Products/Release/SuperRightClickFinder.appex"
 DIST_DIR="$ROOT_DIR/dist"
 STAGING_DIR="$(/usr/bin/mktemp -d "${TMPDIR:-/tmp}/SuperRightClick.XXXXXX")"
+LSREGISTER_PATH="/System/Library/Frameworks/CoreServices.framework/Versions/Current/Frameworks/LaunchServices.framework/Versions/Current/Support/lsregister"
 
 cleanup() {
+  # xcodebuild can register a development product with Launch Services even
+  # though this script only needs its files. A second Finder extension with the
+  # production bundle identifier may then win over the copy in /Applications.
+  # Unregister only these exact build-product paths; never change enablement by
+  # bundle identifier and never touch the installed application.
+  if [[ -d "$APP_PATH" && -x "$LSREGISTER_PATH" ]]; then
+    "$LSREGISTER_PATH" -u "$APP_PATH" >/dev/null 2>&1 || true
+  fi
+  for extension in "$STANDALONE_EXTENSION_PATH" "$EXTENSION_PATH"; do
+    if [[ -d "$extension" ]]; then
+      /usr/bin/pluginkit -r "$extension" >/dev/null 2>&1 || true
+    fi
+  done
   /bin/rm -rf "$STAGING_DIR"
 }
 trap cleanup EXIT

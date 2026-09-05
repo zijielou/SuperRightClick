@@ -1,6 +1,7 @@
 import AppKit
 import FinderSync
 import SwiftUI
+import UniformTypeIdentifiers
 
 private final class WeakWindowBox: @unchecked Sendable {
     weak var window: NSWindow?
@@ -12,14 +13,50 @@ private final class WeakWindowBox: @unchecked Sendable {
 
 @MainActor
 final class AppLifecycleModel: NSObject, ObservableObject {
+    private struct CompletedDestructiveConfirmationResponse {
+        let response: DestructiveConfirmationResponse
+        let request: DestructiveConfirmationRequest
+        let completedAt: Date
+    }
+
+    private struct CompletedTransferDestinationResponse {
+        let response: TransferDestinationPickerResponse
+        let request: TransferDestinationPickerRequest
+        let completedAt: Date
+    }
+
     private let observers = NotificationObservationBag()
     private var statusItem: NSStatusItem?
     private var fallbackSettingsWindow: NSWindow?
     private var renameTask: Task<Void, Never>?
     private var destructiveConfirmationTask: Task<Void, Never>?
     private var pendingDestructiveConfirmations: [DestructiveConfirmationRequest] = []
-    private var handledDestructiveConfirmationIDs: [UUID: Date] = [:]
+    private var validatingDestructiveConfirmationIDs = Set<UUID>()
+    private var inFlightDestructiveConfirmationIDs = Set<UUID>()
+    private var resendingDestructiveConfirmationIDs = Set<UUID>()
+    private var completedDestructiveConfirmationResponses: [
+        UUID: CompletedDestructiveConfirmationResponse
+    ] = [:]
+    private var transferDestinationPickerTask: Task<Void, Never>?
+    private var pendingTransferDestinationPickers: [TransferDestinationPickerRequest] = []
+    private var validatingTransferDestinationPickerIDs = Set<UUID>()
+    private var inFlightTransferDestinationPickerIDs = Set<UUID>()
+    private var resendingTransferDestinationPickerIDs = Set<UUID>()
+    private var completedTransferDestinationResponses: [
+        UUID: CompletedTransferDestinationResponse
+    ] = [:]
     private var configuration: MenuConfiguration
+
+    private var canAcceptAnotherHostUIRequest: Bool {
+        HostUIRequestAdmission.canAccept(
+            validating: validatingDestructiveConfirmationIDs.count
+                + validatingTransferDestinationPickerIDs.count,
+            pending: pendingDestructiveConfirmations.count
+                + pendingTransferDestinationPickers.count,
+            inFlight: inFlightDestructiveConfirmationIDs.count
+                + inFlightTransferDestinationPickerIDs.count
+        )
+    }
 
     override init() {
         let initialConfiguration = ConfigurationStore.load()
@@ -41,6 +78,9 @@ final class AppLifecycleModel: NSObject, ObservableObject {
         observers.addDistributed(DestructiveConfirmationBridge.observeRequests { [weak self] url in
             self?.enqueueDestructiveConfirmation(at: url)
         })
+        observers.addDistributed(TransferDestinationPickerBridge.observeRequests { [weak self] url in
+            self?.enqueueTransferDestinationPicker(at: url)
+        })
         if let launchURL = Self.renameURLFromLaunchArguments() {
             renameInFinder(launchURL)
         }
@@ -48,6 +88,12 @@ final class AppLifecycleModel: NSObject, ObservableObject {
             Task { @MainActor [weak self] in
                 await Task.yield()
                 self?.enqueueDestructiveConfirmation(at: requestURL)
+            }
+        }
+        if let requestURL = Self.transferDestinationPickerURLFromLaunchArguments() {
+            Task { @MainActor [weak self] in
+                await Task.yield()
+                self?.enqueueTransferDestinationPicker(at: requestURL)
             }
         }
     }
@@ -68,53 +114,348 @@ final class AppLifecycleModel: NSObject, ObservableObject {
         return URL(fileURLWithPath: arguments[marker + 1]).standardizedFileURL
     }
 
+    private static func transferDestinationPickerURLFromLaunchArguments(
+        _ arguments: [String] = ProcessInfo.processInfo.arguments
+    ) -> URL? {
+        guard let marker = arguments.firstIndex(of: TransferDestinationPickerBridge.launchArgument),
+              arguments.indices.contains(marker + 1) else { return nil }
+        return URL(fileURLWithPath: arguments[marker + 1]).standardizedFileURL
+    }
+
     private func enqueueDestructiveConfirmation(at requestURL: URL) {
-        let request: DestructiveConfirmationRequest
-        do {
-            request = try DestructiveConfirmationBridge.readRequest(at: requestURL)
-        } catch {
+        let expiry = Date().addingTimeInterval(-300)
+        completedDestructiveConfirmationResponses =
+            completedDestructiveConfirmationResponses.filter {
+                $0.value.completedAt >= expiry
+            }
+        guard let requestID = DestructiveConfirmationBridge.requestID(from: requestURL) else {
             return
         }
 
-        let expiry = Date().addingTimeInterval(-300)
-        handledDestructiveConfirmationIDs = handledDestructiveConfirmationIDs.filter {
-            $0.value >= expiry
+        if let completed = completedDestructiveConfirmationResponses[requestID] {
+            scheduleDestructiveConfirmationResponseResend(completed)
+            return
         }
-        guard handledDestructiveConfirmationIDs[request.id] == nil else { return }
+        guard !validatingDestructiveConfirmationIDs.contains(requestID),
+              !inFlightDestructiveConfirmationIDs.contains(requestID),
+              !pendingDestructiveConfirmations.contains(where: { $0.id == requestID }),
+              canAcceptAnotherHostUIRequest else { return }
 
-        handledDestructiveConfirmationIDs[request.id] = Date()
-        pendingDestructiveConfirmations.append(request)
-        processNextDestructiveConfirmation()
+        validatingDestructiveConfirmationIDs.insert(requestID)
+        Task { @MainActor [weak self] in
+            let request = await Task.detached(priority: .userInitiated) {
+                Self.validatedDestructiveConfirmationRequest(at: requestURL)
+            }.value
+            guard let self else { return }
+            self.validatingDestructiveConfirmationIDs.remove(requestID)
+            guard let request,
+                  request.id == requestID,
+                  self.completedDestructiveConfirmationResponses[requestID] == nil,
+                  !self.inFlightDestructiveConfirmationIDs.contains(requestID),
+                  !self.pendingDestructiveConfirmations.contains(where: {
+                      $0.id == requestID
+                  }),
+                  self.canAcceptAnotherHostUIRequest else { return }
+            self.pendingDestructiveConfirmations.append(request)
+            self.processNextDestructiveConfirmation()
+        }
+    }
+
+    nonisolated private static func validatedDestructiveConfirmationRequest(
+        at requestURL: URL
+    ) -> DestructiveConfirmationRequest? {
+        guard let request = try? DestructiveConfirmationBridge.readRequest(at: requestURL),
+              DestructiveConfirmationBridge.hasExpectedProductionTransport(
+                  request,
+                  requestURL: requestURL
+              ),
+              request.containingHostBundleIdentity == currentHostBundleIdentity(),
+              let expectedCodeHash = embeddedFinderExtensionCodeHash(),
+              let peerCodeHash = try? LocalUnixSocket.peerCodeHash(
+                  at: request.replySocketPath
+              ),
+              peerCodeHash == expectedCodeHash else { return nil }
+        return request
     }
 
     private func processNextDestructiveConfirmation() {
         guard destructiveConfirmationTask == nil,
+              transferDestinationPickerTask == nil,
               !pendingDestructiveConfirmations.isEmpty else { return }
         let request = pendingDestructiveConfirmations.removeFirst()
+        inFlightDestructiveConfirmationIDs.insert(request.id)
         destructiveConfirmationTask = Task { @MainActor [weak self] in
             guard let self else { return }
             let approved = await self.presentDestructiveConfirmation(request)
-            await self.sendDestructiveConfirmationResponse(approved, for: request)
+            let response = DestructiveConfirmationResponse(
+                requestID: request.id,
+                requestDigest: request.authenticationDigest,
+                approved: approved
+            )
+            self.inFlightDestructiveConfirmationIDs.remove(request.id)
+            self.completedDestructiveConfirmationResponses[request.id] =
+                CompletedDestructiveConfirmationResponse(
+                    response: response,
+                    request: request,
+                    completedAt: Date()
+                )
+            await self.sendDestructiveConfirmationResponse(response, for: request)
             self.destructiveConfirmationTask = nil
+            self.processNextTransferDestinationPicker()
             self.processNextDestructiveConfirmation()
         }
     }
 
     private func sendDestructiveConfirmationResponse(
-        _ approved: Bool,
+        _ response: DestructiveConfirmationResponse,
         for request: DestructiveConfirmationRequest
     ) async {
-        let response = DestructiveConfirmationResponse(
-            requestID: request.id,
-            requestDigest: request.authenticationDigest,
-            approved: approved
-        )
+        guard let expectedPeerCodeHash = Self.embeddedFinderExtensionCodeHash() else { return }
         await Task.detached(priority: .userInitiated) {
             try? DestructiveConfirmationBridge.sendResponse(
                 response,
-                toSocketPath: request.replySocketPath
+                toSocketPath: request.replySocketPath,
+                expectedPeerCodeHash: expectedPeerCodeHash
             )
         }.value
+    }
+
+    private func scheduleDestructiveConfirmationResponseResend(
+        _ completed: CompletedDestructiveConfirmationResponse
+    ) {
+        guard resendingDestructiveConfirmationIDs.insert(completed.request.id).inserted else {
+            return
+        }
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            await self.sendDestructiveConfirmationResponse(
+                completed.response,
+                for: completed.request
+            )
+            self.resendingDestructiveConfirmationIDs.remove(completed.request.id)
+        }
+    }
+
+    private func enqueueTransferDestinationPicker(at requestURL: URL) {
+        let expiry = Date().addingTimeInterval(-300)
+        completedTransferDestinationResponses = completedTransferDestinationResponses.filter {
+            $0.value.completedAt >= expiry
+        }
+        guard let requestID = TransferDestinationPickerBridge.requestID(from: requestURL) else {
+            return
+        }
+
+        if let completed = completedTransferDestinationResponses[requestID] {
+            // The extension keeps publishing wake-ups until it receives a reply.
+            // Re-send the exact authenticated response after a transient socket
+            // failure instead of permanently discarding the request ID.
+            scheduleTransferDestinationPickerResponseResend(completed)
+            return
+        }
+        guard !validatingTransferDestinationPickerIDs.contains(requestID),
+              !inFlightTransferDestinationPickerIDs.contains(requestID),
+              !pendingTransferDestinationPickers.contains(where: { $0.id == requestID }),
+              canAcceptAnotherHostUIRequest else { return }
+
+        validatingTransferDestinationPickerIDs.insert(requestID)
+        Task { @MainActor [weak self] in
+            let request = await Task.detached(priority: .userInitiated) {
+                Self.validatedTransferDestinationPickerRequest(at: requestURL)
+            }.value
+            guard let self else { return }
+            self.validatingTransferDestinationPickerIDs.remove(requestID)
+            guard let request,
+                  request.id == requestID,
+                  self.completedTransferDestinationResponses[requestID] == nil,
+                  !self.inFlightTransferDestinationPickerIDs.contains(requestID),
+                  !self.pendingTransferDestinationPickers.contains(where: {
+                      $0.id == requestID
+                  }),
+                  self.canAcceptAnotherHostUIRequest else { return }
+            self.pendingTransferDestinationPickers.append(request)
+            self.processNextTransferDestinationPicker()
+        }
+    }
+
+    nonisolated private static func validatedTransferDestinationPickerRequest(
+        at requestURL: URL
+    ) -> TransferDestinationPickerRequest? {
+        guard let request = try? TransferDestinationPickerBridge.readRequest(at: requestURL),
+              TransferDestinationPickerBridge.hasExpectedProductionTransport(
+                  request,
+                  requestURL: requestURL
+              ),
+              request.containingHostBundleIdentity == currentHostBundleIdentity(),
+              let expectedCodeHash = embeddedFinderExtensionCodeHash(),
+              let peerCodeHash = try? LocalUnixSocket.peerCodeHash(
+                  at: request.replySocketPath
+              ),
+              peerCodeHash == expectedCodeHash else { return nil }
+        return request
+    }
+
+    nonisolated private static func currentHostBundleIdentity() -> HostBundleIdentity? {
+        HostBundleIdentity.capture(at: Bundle.main.bundleURL)
+    }
+
+    nonisolated private static func embeddedFinderExtensionCodeHash() -> Data? {
+        guard let plugInsURL = Bundle.main.builtInPlugInsURL else { return nil }
+        let extensionURL = plugInsURL.appendingPathComponent(
+            "SuperRightClickFinder.appex",
+            isDirectory: true
+        )
+        return CodeIdentity.codeHash(at: extensionURL)
+    }
+
+    private func processNextTransferDestinationPicker() {
+        guard transferDestinationPickerTask == nil,
+              destructiveConfirmationTask == nil,
+              !pendingTransferDestinationPickers.isEmpty else { return }
+        let request = pendingTransferDestinationPickers.removeFirst()
+        inFlightTransferDestinationPickerIDs.insert(request.id)
+        transferDestinationPickerTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            let selection = await self.presentTransferDestinationPicker(request)
+            let response = TransferDestinationPickerResponse(
+                requestID: request.id,
+                requestDigest: request.authenticationDigest,
+                outcome: selection.outcome,
+                destinationBookmark: selection.bookmark
+            )
+            self.inFlightTransferDestinationPickerIDs.remove(request.id)
+            self.completedTransferDestinationResponses[request.id] =
+                CompletedTransferDestinationResponse(
+                    response: response,
+                    request: request,
+                    completedAt: Date()
+                )
+            await self.sendTransferDestinationPickerResponse(
+                response,
+                for: request
+            )
+            self.transferDestinationPickerTask = nil
+            self.processNextDestructiveConfirmation()
+            self.processNextTransferDestinationPicker()
+        }
+    }
+
+    private func sendTransferDestinationPickerResponse(
+        _ response: TransferDestinationPickerResponse,
+        for request: TransferDestinationPickerRequest
+    ) async {
+        guard let expectedPeerCodeHash = Self.embeddedFinderExtensionCodeHash() else { return }
+        await Task.detached(priority: .userInitiated) {
+            try? TransferDestinationPickerBridge.sendResponse(
+                response,
+                toSocketPath: request.replySocketPath,
+                expectedPeerCodeHash: expectedPeerCodeHash
+            )
+        }.value
+    }
+
+    private func scheduleTransferDestinationPickerResponseResend(
+        _ completed: CompletedTransferDestinationResponse
+    ) {
+        guard resendingTransferDestinationPickerIDs.insert(completed.request.id).inserted else {
+            return
+        }
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            await self.sendTransferDestinationPickerResponse(
+                completed.response,
+                for: completed.request
+            )
+            self.resendingTransferDestinationPickerIDs.remove(completed.request.id)
+        }
+    }
+
+    private func presentTransferDestinationPicker(
+        _ request: TransferDestinationPickerRequest
+    ) async -> (outcome: TransferDestinationPickerResponse.Outcome, bookmark: Data?) {
+        let remaining = TransferDestinationPickerBridge.remainingResponseLifetime(for: request)
+        guard remaining > 0 else { return (.failed, nil) }
+
+        await activateForHostUI()
+
+        let language = configuration.language
+        let panel = NSOpenPanel()
+        let selectsIconImage = request.operation == .selectFolderIconImage
+        let title: String
+        switch request.operation {
+        case .copy:
+            title = "选择复制目标文件夹"
+        case .move:
+            title = "选择移动目标文件夹"
+        case .selectFolderIconImage:
+            title = "选择文件夹图标图片"
+        }
+        panel.title = Localizer.text(title, language: language)
+        panel.canChooseDirectories = !selectsIconImage
+        panel.canChooseFiles = selectsIconImage
+        panel.allowsMultipleSelection = false
+        panel.canCreateDirectories = !selectsIconImage
+        panel.resolvesAliases = true
+        if selectsIconImage {
+            panel.allowedContentTypes = [.image]
+        }
+        panel.level = .modalPanel
+        panel.collectionBehavior.formUnion([.moveToActiveSpace, .fullScreenAuxiliary])
+
+        let timeoutTask = Task { @MainActor [weak panel] in
+            do {
+                try await Task.sleep(for: .seconds(remaining))
+            } catch {
+                return
+            }
+            panel?.cancel(nil)
+        }
+        defer { timeoutTask.cancel() }
+
+        let response = await panel.begin()
+        guard response == .OK,
+              Date().timeIntervalSince(request.createdAt)
+                < TransferDestinationPickerBridge.responseTimeoutSeconds,
+              let destination = panel.url else {
+            return (.cancelled, nil)
+        }
+
+        do {
+            let resourceKeys: Set<URLResourceKey> = selectsIconImage
+                ? [.isRegularFileKey, .contentTypeKey]
+                : [.isDirectoryKey]
+            let values = try destination.resourceValues(forKeys: resourceKeys)
+            if selectsIconImage {
+                guard values.isRegularFile == true,
+                      values.contentType?.conforms(to: .image) == true else {
+                    return (.failed, nil)
+                }
+            } else {
+                guard values.isDirectory == true else { return (.failed, nil) }
+            }
+            // For an immediate cross-process handoff Apple requires an
+            // implicit-scope bookmark. Explicit app-scoped bookmarks are tied
+            // to the creator's signing identity and cannot be consumed by the
+            // separately sandboxed Finder extension.
+            let bookmark = try TransferDestinationPickerBridge
+                .makeEphemeralBookmark(for: destination)
+            guard !bookmark.isEmpty,
+                  bookmark.count <= TransferDestinationPickerBridge.maximumBookmarkSize else {
+                return (.failed, nil)
+            }
+            return (.selected, bookmark)
+        } catch {
+            return (.failed, nil)
+        }
+    }
+
+    private func activateForHostUI() async {
+        NSApp.activate()
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: .milliseconds(600))
+        while !NSApp.isActive, clock.now < deadline {
+            try? await Task.sleep(for: .milliseconds(40))
+            if !NSApp.isActive { NSApp.activate() }
+        }
     }
 
     private func presentDestructiveConfirmation(
@@ -126,10 +467,10 @@ final class AppLifecycleModel: NSObject, ObservableObject {
         )
         guard remaining > 0 else { return false }
 
-        NSApp.activate(ignoringOtherApps: true)
+        NSApp.activate()
         if !NSApp.isActive {
             try? await Task.sleep(for: .milliseconds(80))
-            if !NSApp.isActive { NSApp.activate(ignoringOtherApps: true) }
+            if !NSApp.isActive { NSApp.activate() }
         }
 
         let language = configuration.language
@@ -162,7 +503,7 @@ final class AppLifecycleModel: NSObject, ObservableObject {
         window.collectionBehavior.formUnion([.moveToActiveSpace, .fullScreenAuxiliary])
         window.makeKeyAndOrderFront(nil)
         if !NSApp.isActive {
-            NSApp.activate(ignoringOtherApps: true)
+            NSApp.activate()
         }
         let windowBox = WeakWindowBox(window)
         let timeout = Timer(timeInterval: remaining, repeats: false) { _ in
@@ -227,7 +568,7 @@ final class AppLifecycleModel: NSObject, ObservableObject {
     }
 
     @objc private func showSettings() {
-        NSApp.activate(ignoringOtherApps: true)
+        NSApp.activate()
         if let window = NSApp.windows.first(where: {
             $0.canBecomeMain && $0 !== fallbackSettingsWindow
         }) {

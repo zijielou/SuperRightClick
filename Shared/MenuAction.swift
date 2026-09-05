@@ -2,6 +2,97 @@ import AppKit
 import CryptoKit
 import Darwin
 import Foundation
+import Security
+
+/// Returns the code-directory hash for an on-disk bundle or a live process.
+/// The host and Finder extension use the same implementation for mutual
+/// authentication over their local response socket.
+enum CodeIdentity {
+    static func codeHash(at bundleURL: URL) -> Data? {
+        var staticCode: SecStaticCode?
+        guard SecStaticCodeCreateWithPath(
+            bundleURL as CFURL,
+            SecCSFlags(),
+            &staticCode
+        ) == errSecSuccess,
+        let staticCode else { return nil }
+        return signingHash(for: staticCode)
+    }
+
+    static func codeHash(processIdentifier: pid_t) -> Data? {
+        let attributes = [
+            kSecGuestAttributePid as String: NSNumber(value: processIdentifier),
+        ] as CFDictionary
+        var code: SecCode?
+        guard SecCodeCopyGuestWithAttributes(
+            nil,
+            attributes,
+            SecCSFlags(),
+            &code
+        ) == errSecSuccess,
+        let code,
+        SecCodeCheckValidity(code, SecCSFlags(), nil) == errSecSuccess else { return nil }
+        var staticCode: SecStaticCode?
+        guard SecCodeCopyStaticCode(code, SecCSFlags(), &staticCode) == errSecSuccess,
+              let staticCode else { return nil }
+        return signingHash(for: staticCode)
+    }
+
+    private static func signingHash(for code: SecStaticCode) -> Data? {
+        var information: CFDictionary?
+        guard SecCodeCopySigningInformation(
+            code,
+            SecCSFlags(rawValue: kSecCSSigningInformation),
+            &information
+        ) == errSecSuccess,
+        let dictionary = information as? [String: Any] else { return nil }
+        return dictionary[kSecCodeInfoUnique as String] as? Data
+    }
+}
+
+/// Compatibility name retained for existing tests and the confirmation server.
+typealias HostCodeIdentity = CodeIdentity
+
+/// Identifies one concrete application bundle on disk. A bundle identifier and
+/// code signature identify an application build, but not a particular installed
+/// copy. Binding host-UI requests to the containing app's directory entry keeps
+/// another copy of the same signed app from responding to the request.
+struct HostBundleIdentity: Codable, Equatable, Hashable, Sendable {
+    let device: UInt64
+    let inode: UInt64
+
+    static func capture(at bundleURL: URL) -> HostBundleIdentity? {
+        var status = stat()
+        let path = bundleURL.standardizedFileURL.path
+        guard path.withCString({ lstat($0, &status) }) == 0,
+              status.st_mode & S_IFMT == S_IFDIR else { return nil }
+        return HostBundleIdentity(
+            device: UInt64(status.st_dev),
+            inode: UInt64(status.st_ino)
+        )
+    }
+
+    /// Finder extensions are embedded at
+    /// `Host.app/Contents/PlugIns/Extension.appex`.
+    static func containingApplicationURL(
+        for extensionBundleURL: URL = Bundle.main.bundleURL
+    ) -> URL? {
+        let extensionURL = extensionBundleURL.standardizedFileURL
+        guard extensionURL.pathExtension == "appex" else { return nil }
+        let plugInsURL = extensionURL.deletingLastPathComponent()
+        guard plugInsURL.lastPathComponent == "PlugIns" else { return nil }
+        let contentsURL = plugInsURL.deletingLastPathComponent()
+        guard contentsURL.lastPathComponent == "Contents" else { return nil }
+        let applicationURL = contentsURL.deletingLastPathComponent()
+        guard applicationURL.pathExtension == "app" else { return nil }
+        return applicationURL
+    }
+
+    static func currentContainingApplication() -> HostBundleIdentity? {
+        guard let applicationURL = containingApplicationURL() else { return nil }
+        return capture(at: applicationURL)
+    }
+}
 
 /// 返回真实登录用户目录，而不是 Finder 扩展沙盒容器的 Home。
 /// Finder Sync 进程中的 `homeDirectoryForCurrentUser`/`~` 可能指向容器，
@@ -338,6 +429,13 @@ enum Localizer {
         "%@：%@": "%@：%@",
         "选择移动目标文件夹": "選擇移動目標資料夾",
         "选择复制目标文件夹": "選擇複製目標資料夾",
+        "所选目标文件夹已失效，请重新选择。": "所選目標資料夾已失效，請重新選擇。",
+        "目标文件夹已被替换或无法访问。": "目標資料夾已被替換或無法存取。",
+        "一个或多个源项目已不存在或无法访问。": "一個或多個來源項目已不存在或無法存取。",
+        "配置已被其他进程更新，请重试。": "設定已由其他程序更新，請重試。",
+        "目录选择超时或宿主应用未响应，请确认 SuperRightClick 主应用已运行。": "資料夾選擇逾時或主應用程式未回應，請確認 SuperRightClick 主應用程式正在執行。",
+        "目录选择响应无效或已过期，请重试。": "資料夾選擇回應無效或已過期，請重試。",
+        "主应用无法保存所选文件夹的访问权限，请重新选择。": "主應用程式無法儲存所選資料夾的存取權限，請重新選擇。",
         "剪贴板中没有可粘贴的文件。": "剪貼簿中沒有可貼上的檔案。",
         "该目录已在常用目录中。": "此目錄已在常用目錄中。",
         "已添加到常用目录。": "已加入常用目錄。",
@@ -349,6 +447,7 @@ enum Localizer {
         "修改：%@": "修改：%@",
         "读取失败：%@": "讀取失敗：%@",
         "找不到应用：%@": "找不到應用程式：%@",
+        "无法使用“%@”打开所选项目：%@": "無法使用「%@」開啟所選項目：%@",
         "隐藏全部项目": "隱藏全部項目",
         "显示全部项目": "顯示全部項目",
         "将修改“%@”第一层的 %@ 个项目，是否继续？": "將修改「%@」第一層的 %@ 個項目，是否繼續？",
@@ -357,6 +456,8 @@ enum Localizer {
         "不能解散受保护目录。": "不能解散受保護目錄。",
         "上级目录存在同名项目：\n%@": "上層目錄存在同名項目：\n%@",
         "将移动 %@ 个项目到上级目录并删除“%@”。": "將移動 %@ 個項目到上層目錄並刪除「%@」。",
+        "将移动文件夹中的项目到上级目录并删除“%@”。": "將移動資料夾中的項目到上層目錄並刪除「%@」。",
+        "无法回滚“%@”：%@": "無法回復「%@」：%@",
         "拒绝删除根目录、主目录或系统保护路径。": "拒絕刪除根目錄、個人專屬目錄或系統保護路徑。",
         "%@：目标已不存在或无法访问。": "%@：目標已不存在或無法存取。",
         "永久删除目标在确认期间发生变化，已取消操作。": "永久刪除目標在確認期間發生變更，已取消操作。",
@@ -548,6 +649,13 @@ enum Localizer {
         "%@：%@": "%@: %@",
         "选择移动目标文件夹": "Choose Move Destination",
         "选择复制目标文件夹": "Choose Copy Destination",
+        "所选目标文件夹已失效，请重新选择。": "The selected destination folder is no longer valid. Choose it again.",
+        "目标文件夹已被替换或无法访问。": "The destination folder was replaced or cannot be accessed.",
+        "一个或多个源项目已不存在或无法访问。": "One or more source items no longer exist or cannot be accessed.",
+        "配置已被其他进程更新，请重试。": "The settings changed in another process. Please try again.",
+        "目录选择超时或宿主应用未响应，请确认 SuperRightClick 主应用已运行。": "Folder selection timed out or the host did not respond. Make sure the SuperRightClick app is running.",
+        "目录选择响应无效或已过期，请重试。": "The folder selection response is invalid or expired. Try again.",
+        "主应用无法保存所选文件夹的访问权限，请重新选择。": "The app could not preserve access to the selected folder. Choose it again.",
         "剪贴板中没有可粘贴的文件。": "The clipboard does not contain files that can be pasted.",
         "该目录已在常用目录中。": "This folder is already in Favorite Folders.",
         "已添加到常用目录。": "Added to Favorite Folders.",
@@ -559,6 +667,7 @@ enum Localizer {
         "修改：%@": "Modified: %@",
         "读取失败：%@": "Could not read: %@",
         "找不到应用：%@": "Application not found: %@",
+        "无法使用“%@”打开所选项目：%@": "Could not open the selected items with “%@”: %@",
         "隐藏全部项目": "Hide All Items",
         "显示全部项目": "Show All Items",
         "将修改“%@”第一层的 %@ 个项目，是否继续？": "Inside “%@”, this will modify %@ items. Continue?",
@@ -567,6 +676,8 @@ enum Localizer {
         "不能解散受保护目录。": "A protected folder cannot be dissolved.",
         "上级目录存在同名项目：\n%@": "The parent folder contains items with the same names:\n%@",
         "将移动 %@ 个项目到上级目录并删除“%@”。": "This will move %@ items to the parent folder and delete “%@”.",
+        "将移动文件夹中的项目到上级目录并删除“%@”。": "This will move the folder’s items to its parent and delete “%@”.",
+        "无法回滚“%@”：%@": "Could not roll back “%@”: %@",
         "拒绝删除根目录、主目录或系统保护路径。": "The root folder, home folder, and protected system paths cannot be deleted.",
         "%@：目标已不存在或无法访问。": "%@: The target no longer exists or cannot be accessed.",
         "永久删除目标在确认期间发生变化，已取消操作。": "A permanent deletion target changed during confirmation. The operation was cancelled.",
@@ -823,6 +934,12 @@ struct AppShortcut: Codable, Identifiable, Hashable, Sendable {
 }
 
 struct MenuConfiguration: Codable, Equatable, Sendable {
+    static let maximumTemplateCount = 512
+    static let maximumDirectoryCount = 512
+    static let maximumOpenWithAppCount = 512
+    static let maximumActionPreferenceCount = 256
+    static let maximumExcludedPathCount = 1_024
+
     var templates: [NewFileTemplate]
     var commonDirectories: [DirectoryShortcut]
     var destinationDirectories: [DirectoryShortcut]
@@ -990,8 +1107,13 @@ struct MenuConfiguration: Codable, Equatable, Sendable {
     }
 
     mutating func mergeMissingDefaults() {
-        actionPreferences.removeAll {
-            $0.action == .openNewWindow || $0.action == .openNewTab || $0.action == .convertWebP
+        // FinderMenuBuilder 会把该列表转成 Dictionary 用于排序。历史配置、
+        // 手工编辑的 defaults 或损坏的跨进程数据可能含有重复 action，
+        // 因此必须在任何消费者看到它之前稳定去重（保留第一项）。
+        let unsupported: Set<FinderMenuAction> = [.openNewWindow, .openNewTab, .convertWebP]
+        var seenActions = Set<FinderMenuAction>()
+        actionPreferences = actionPreferences.filter {
+            !unsupported.contains($0.action) && seenActions.insert($0.action).inserted
         }
         let known = Set(actionPreferences.map(\.action))
         actionPreferences.append(contentsOf: Self.defaultActionPreferences.filter {
@@ -1002,6 +1124,212 @@ struct MenuConfiguration: Codable, Equatable, Sendable {
         }) {
             openWithApps.append(builtin)
         }
+    }
+
+    /// 配置的唯一信任边界。无论数据来自旧 UserDefaults、共享文件
+    /// 还是当前设置 UI，在它进入 Finder 菜单或文件操作前都要调用此方法。
+    /// 该方法保留合法的旧数据，只移除无法由设置界面产生或会越界的值。
+    func validatedAndNormalized() -> MenuConfiguration {
+        var value = self
+
+        // Every array exposed as `Identifiable` must have a unique identity before
+        // SwiftUI/Finder consume it. Keep the first occurrence so normalization is
+        // deterministic and never changes which row an existing binding refers to.
+        let uniqueTemplates = Self.stablyDeduplicated(value.templates, by: \.id)
+        value.templates = Array(uniqueTemplates.prefix(Self.maximumTemplateCount)).map { template in
+            var template = template
+            let trimmedName = template.name.trimmingCharacters(in: .whitespacesAndNewlines)
+            if trimmedName.isEmpty || trimmedName == "." || trimmedName == ".."
+                || trimmedName.contains("/") || trimmedName.utf8.count > 255 {
+                template.name = "Template"
+                template.isEnabled = false
+            } else {
+                template.name = trimmedName
+            }
+
+            let trimmedExtension = template.fileExtension.trimmingCharacters(
+                in: CharacterSet(charactersIn: ". ")
+            )
+            let allowedExtensionCharacters = CharacterSet.alphanumerics.union(
+                CharacterSet(charactersIn: "-_")
+            )
+            if trimmedExtension.isEmpty || trimmedExtension.count > 20
+                || !trimmedExtension.unicodeScalars.allSatisfy({
+                    allowedExtensionCharacters.contains($0)
+                }) {
+                template.fileExtension = "txt"
+                template.isEnabled = false
+            } else {
+                template.fileExtension = trimmedExtension
+            }
+
+            if template.kind == .custom {
+                if let filename = template.storedFilename,
+                   Self.isValidStoredTemplateFilename(filename) {
+                    template.storedFilename = filename
+                } else {
+                    // 保留记录以便用户在设置中识别，但绝不允许一个不完整
+                    // 或越界的自定义模板进入可执行菜单。
+                    template.storedFilename = nil
+                    template.isEnabled = false
+                }
+            } else {
+                // 内置模板不需要访问模板存储目录；丢弃伪造的文件名，
+                // 防止后续配置差分把它当成待删除的模板副本。
+                template.storedFilename = nil
+            }
+
+            if let variant = template.iconVariant, !(0...3).contains(variant) {
+                template.iconVariant = nil
+            }
+            return template
+        }
+        value.deduplicateTemplates()
+
+        value.commonDirectories = Self.normalizedDirectories(value.commonDirectories)
+        value.destinationDirectories = Self.normalizedDirectories(value.destinationDirectories)
+        value.openWithApps = Self.normalizedApps(value.openWithApps)
+
+        value.actionPreferences = Array(
+            value.actionPreferences.prefix(Self.maximumActionPreferenceCount)
+        ).map { preference in
+            var preference = preference
+            if let customName = preference.customName {
+                let bounded = String(customName.prefix(512))
+                preference.customName = bounded.trimmingCharacters(in: .whitespacesAndNewlines)
+                    .isEmpty ? nil : bounded
+            }
+            if let customIconPath = preference.customIconPath {
+                if !ManagedCustomIconStore.isControlledPath(
+                    customIconPath,
+                    for: preference.action
+                ) {
+                    preference.customIconPath = nil
+                } else {
+                    preference.customIconPath = URL(fileURLWithPath: customIconPath)
+                        .standardizedFileURL.path
+                }
+            }
+            return preference
+        }
+        value.mergeMissingDefaults()
+
+        var seenExcludedPaths = Set<String>()
+        value.excludedPaths = Array(
+            value.excludedPaths.prefix(Self.maximumExcludedPathCount)
+        ).compactMap { path in
+            guard let normalized = Self.normalizedConfiguredPath(path),
+                  seenExcludedPaths.insert(normalized).inserted else { return nil }
+            return normalized
+        }
+
+        value.imageQuality = min(max(value.imageQuality, 0.1), 1)
+        let background = value.jpgBackgroundHex.trimmingCharacters(in: .whitespacesAndNewlines)
+            .uppercased()
+        let hex = background.hasPrefix("#") ? String(background.dropFirst()) : background
+        if hex.count == 6,
+           hex.unicodeScalars.allSatisfy({ CharacterSet(charactersIn: "0123456789ABCDEF").contains($0) }) {
+            value.jpgBackgroundHex = "#\(hex)"
+        } else {
+            value.jpgBackgroundHex = "#FFFFFF"
+        }
+        return value
+    }
+
+    /// Returning false is intentionally different from normalization: silently
+    /// truncating a newly appended item would make an import look successful and
+    /// can leave an unreferenced template copy behind.
+    var isWithinStorageCapacity: Bool {
+        templates.count <= Self.maximumTemplateCount
+            && commonDirectories.count <= Self.maximumDirectoryCount
+            && destinationDirectories.count <= Self.maximumDirectoryCount
+            && openWithApps.count <= Self.maximumOpenWithAppCount
+            && actionPreferences.count <= Self.maximumActionPreferenceCount
+            && excludedPaths.count <= Self.maximumExcludedPathCount
+    }
+
+    /// `storedFilename` 必须是单一 basename，且添加到模板根目录后仍在根目录内。
+    /// 使用固定虚拟根做纯路径校验，不依赖目标文件已经存在。
+    static func isValidStoredTemplateFilename(_ filename: String) -> Bool {
+        guard !filename.isEmpty,
+              filename != ".",
+              filename != "..",
+              filename.utf8.count <= 255,
+              !filename.contains("/"),
+              !filename.contains("\0"),
+              (filename as NSString).lastPathComponent == filename else { return false }
+        let root = URL(fileURLWithPath: "/SuperRightClick/Templates", isDirectory: true)
+            .standardizedFileURL
+        let candidate = root.appendingPathComponent(filename).standardizedFileURL
+        return candidate.deletingLastPathComponent() == root
+    }
+
+    private static func normalizedDirectories(
+        _ directories: [DirectoryShortcut]
+    ) -> [DirectoryShortcut] {
+        var seenIDs = Set<UUID>()
+        var seenPaths = Set<String>()
+        let unique = stablyDeduplicated(directories, by: \.id)
+        return Array(unique.prefix(Self.maximumDirectoryCount)).compactMap { directory in
+            guard let path = normalizedConfiguredPath(directory.path),
+                  seenIDs.insert(directory.id).inserted,
+                  seenPaths.insert(path).inserted else { return nil }
+            var directory = directory
+            directory.name = String(directory.name.prefix(512))
+            directory.path = path
+            return directory
+        }
+    }
+
+    private static func normalizedApps(_ apps: [AppShortcut]) -> [AppShortcut] {
+        var seenIDs = Set<UUID>()
+        var seen = Set<String>()
+        let unique = stablyDeduplicated(apps, by: \.id)
+        return Array(unique.prefix(Self.maximumOpenWithAppCount)).compactMap { app in
+            guard seenIDs.insert(app.id).inserted else { return nil }
+            let rawPath = app.appPath.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard rawPath.hasPrefix("/"), !rawPath.contains("\0") else { return nil }
+            let path = URL(fileURLWithPath: rawPath).standardizedFileURL.path
+            guard URL(fileURLWithPath: path).pathExtension.caseInsensitiveCompare("app") == .orderedSame
+            else { return nil }
+            var app = app
+            app.name = String(app.name.prefix(512))
+            app.appPath = path
+            if let identifier = app.bundleIdentifier {
+                let trimmed = identifier.trimmingCharacters(in: .whitespacesAndNewlines)
+                app.bundleIdentifier = trimmed.isEmpty || trimmed.utf8.count > 255
+                    || trimmed.contains("/") || trimmed.contains("\0") ? nil : trimmed
+            }
+            let identity = app.bundleIdentifier?.lowercased() ?? path.lowercased()
+            guard seen.insert(identity).inserted else { return nil }
+            return app
+        }
+    }
+
+    private static func stablyDeduplicated<Element>(
+        _ values: [Element],
+        by identifier: KeyPath<Element, UUID>
+    ) -> [Element] {
+        var seen = Set<UUID>()
+        return values.filter { seen.insert($0[keyPath: identifier]).inserted }
+    }
+
+    private static func normalizedConfiguredPath(_ path: String) -> String? {
+        let trimmed = path.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, !trimmed.contains("\0") else { return nil }
+        if trimmed == "~" { return trimmed }
+        if trimmed.hasPrefix("~/") {
+            let relative = String(trimmed.dropFirst(2))
+            guard !relative.isEmpty else { return "~" }
+            let root = URL(fileURLWithPath: "/SuperRightClick/Home", isDirectory: true)
+            let candidate = root.appendingPathComponent(relative).standardizedFileURL
+            guard candidate.path == root.path || candidate.path.hasPrefix(root.path + "/") else {
+                return nil
+            }
+            return trimmed
+        }
+        guard trimmed.hasPrefix("/") else { return nil }
+        return URL(fileURLWithPath: trimmed).standardizedFileURL.path
     }
 
     func preference(for action: FinderMenuAction) -> ActionPreference {
@@ -1060,6 +1388,265 @@ struct MenuConfiguration: Codable, Equatable, Sendable {
         enableDissolveFolder: false,
         enablePermanentDelete: false
     )
+}
+
+/// Result of reconciling an unsaved settings draft with a newer authoritative
+/// configuration. Non-overlapping changes are combined. When both sides change
+/// the same field differently, the visible local draft is retained and marked as
+/// conflicted so it is never silently replaced or automatically persisted over
+/// the other process's edit.
+struct ConfigurationDraftMergeResult: Sendable, Equatable {
+    let configuration: MenuConfiguration
+    let hasConflicts: Bool
+}
+
+enum ConfigurationDraftMerger {
+    static func merge(
+        base: MenuConfiguration,
+        local: MenuConfiguration,
+        remote: MenuConfiguration
+    ) -> ConfigurationDraftMergeResult {
+        var result = remote
+        var hasConflicts = false
+
+        func resolved<Value: Equatable>(
+            _ baseValue: Value,
+            _ localValue: Value,
+            _ remoteValue: Value
+        ) -> Value {
+            if localValue == baseValue { return remoteValue }
+            if remoteValue == baseValue || localValue == remoteValue { return localValue }
+            hasConflicts = true
+            return localValue
+        }
+
+        result.templates = resolved(base.templates, local.templates, remote.templates)
+        result.commonDirectories = resolved(
+            base.commonDirectories,
+            local.commonDirectories,
+            remote.commonDirectories
+        )
+        result.destinationDirectories = resolved(
+            base.destinationDirectories,
+            local.destinationDirectories,
+            remote.destinationDirectories
+        )
+        result.openWithApps = resolved(base.openWithApps, local.openWithApps, remote.openWithApps)
+        result.autoOpenNewFile = resolved(
+            base.autoOpenNewFile,
+            local.autoOpenNewFile,
+            remote.autoOpenNewFile
+        )
+        result.playCreationSound = resolved(
+            base.playCreationSound,
+            local.playCreationSound,
+            remote.playCreationSound
+        )
+        result.mergeFileOperations = resolved(
+            base.mergeFileOperations,
+            local.mergeFileOperations,
+            remote.mergeFileOperations
+        )
+        result.enableBulkVisibility = resolved(
+            base.enableBulkVisibility,
+            local.enableBulkVisibility,
+            remote.enableBulkVisibility
+        )
+        result.enablePermissionChanges = resolved(
+            base.enablePermissionChanges,
+            local.enablePermissionChanges,
+            remote.enablePermissionChanges
+        )
+        result.enableDissolveFolder = resolved(
+            base.enableDissolveFolder,
+            local.enableDissolveFolder,
+            remote.enableDissolveFolder
+        )
+        result.enablePermanentDelete = resolved(
+            base.enablePermanentDelete,
+            local.enablePermanentDelete,
+            remote.enablePermanentDelete
+        )
+        result.masterEnabled = resolved(
+            base.masterEnabled,
+            local.masterEnabled,
+            remote.masterEnabled
+        )
+        result.actionPreferences = resolved(
+            base.actionPreferences,
+            local.actionPreferences,
+            remote.actionPreferences
+        )
+        result.showMenuIcons = resolved(
+            base.showMenuIcons,
+            local.showMenuIcons,
+            remote.showMenuIcons
+        )
+        result.mergeOpenWithApps = resolved(
+            base.mergeOpenWithApps,
+            local.mergeOpenWithApps,
+            remote.mergeOpenWithApps
+        )
+        result.mergeImageOperations = resolved(
+            base.mergeImageOperations,
+            local.mergeImageOperations,
+            remote.mergeImageOperations
+        )
+        result.excludedPaths = resolved(
+            base.excludedPaths,
+            local.excludedPaths,
+            remote.excludedPaths
+        )
+        result.playOperationSound = resolved(
+            base.playOperationSound,
+            local.playOperationSound,
+            remote.playOperationSound
+        )
+        result.hideCutItems = resolved(base.hideCutItems, local.hideCutItems, remote.hideCutItems)
+        result.showMenuBarIcon = resolved(
+            base.showMenuBarIcon,
+            local.showMenuBarIcon,
+            remote.showMenuBarIcon
+        )
+        result.language = resolved(base.language, local.language, remote.language)
+        result.imageQuality = resolved(base.imageQuality, local.imageQuality, remote.imageQuality)
+        result.jpgBackgroundHex = resolved(
+            base.jpgBackgroundHex,
+            local.jpgBackgroundHex,
+            remote.jpgBackgroundHex
+        )
+        result.wallpaperAllScreens = resolved(
+            base.wallpaperAllScreens,
+            local.wallpaperAllScreens,
+            remote.wallpaperAllScreens
+        )
+
+        return ConfigurationDraftMergeResult(
+            configuration: result,
+            hasConflicts: hasConflicts
+        )
+    }
+}
+
+/// Owns the versioned files used by action-specific custom menu icons. The
+/// configuration commit is supplied as a closure so file replacement follows a
+/// small transaction: write the new bytes, commit their path, then retire the old
+/// version. A failed commit removes only the new unreferenced file.
+enum ManagedCustomIconStore {
+    static let directoryURL = UserPaths.homeDirectory
+        .appendingPathComponent(
+            "Library/Application Support/SuperRightClick/Icons",
+            isDirectory: true
+        )
+        .standardizedFileURL
+
+    static func isControlledPath(_ path: String, for action: FinderMenuAction) -> Bool {
+        guard !path.contains("\0") else { return false }
+        let candidate = URL(fileURLWithPath: path).standardizedFileURL
+        guard candidate.deletingLastPathComponent() == directoryURL else { return false }
+        let filename = candidate.lastPathComponent
+        let legacyFilename = "\(action.rawValue).png"
+        if filename == legacyFilename { return true }
+
+        let prefix = "\(action.rawValue)-"
+        guard filename.hasPrefix(prefix), filename.hasSuffix(".png") else { return false }
+        let identifierStart = filename.index(filename.startIndex, offsetBy: prefix.count)
+        let identifierEnd = filename.index(filename.endIndex, offsetBy: -4)
+        guard identifierStart < identifierEnd else { return false }
+        return UUID(uuidString: String(filename[identifierStart..<identifierEnd])) != nil
+    }
+
+    static func install(
+        pngData: Data,
+        for action: FinderMenuAction,
+        replacing oldPath: String?,
+        directory: URL = directoryURL,
+        commit: (String) -> Bool
+    ) throws -> Bool {
+        try ensurePrivateDirectory(directory)
+        let destination = directory.appendingPathComponent(
+            "\(action.rawValue)-\(UUID().uuidString.lowercased()).png"
+        )
+        try pngData.write(to: destination, options: [.atomic])
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o600],
+            ofItemAtPath: destination.path
+        )
+
+        guard commit(destination.path) else {
+            try? FileManager.default.removeItem(at: destination)
+            return false
+        }
+        removeControlledFileIfNeeded(oldPath, for: action, excluding: destination, directory: directory)
+        return true
+    }
+
+    static func clear(
+        path oldPath: String?,
+        for action: FinderMenuAction,
+        directory: URL = directoryURL,
+        commit: () -> Bool
+    ) -> Bool {
+        guard commit() else { return false }
+        removeControlledFileIfNeeded(oldPath, for: action, excluding: nil, directory: directory)
+        return true
+    }
+
+    private static func removeControlledFileIfNeeded(
+        _ path: String?,
+        for action: FinderMenuAction,
+        excluding retainedURL: URL?,
+        directory: URL
+    ) {
+        guard let path else { return }
+        let candidate = URL(fileURLWithPath: path).standardizedFileURL
+        let productionDirectory = directoryURL
+        let isControlled: Bool
+        if directory.standardizedFileURL == productionDirectory {
+            isControlled = isControlledPath(path, for: action)
+        } else {
+            // Test/custom roots retain the same strict basename grammar while
+            // never permitting a path to escape the injected root.
+            isControlled = candidate.deletingLastPathComponent() == directory.standardizedFileURL
+                && isControlledFilename(candidate.lastPathComponent, for: action)
+        }
+        guard isControlled, candidate != retainedURL?.standardizedFileURL else { return }
+        try? FileManager.default.removeItem(at: candidate)
+    }
+
+    private static func isControlledFilename(
+        _ filename: String,
+        for action: FinderMenuAction
+    ) -> Bool {
+        if filename == "\(action.rawValue).png" { return true }
+        let prefix = "\(action.rawValue)-"
+        guard filename.hasPrefix(prefix), filename.hasSuffix(".png") else { return false }
+        let identifierStart = filename.index(filename.startIndex, offsetBy: prefix.count)
+        let identifierEnd = filename.index(filename.endIndex, offsetBy: -4)
+        return identifierStart < identifierEnd
+            && UUID(uuidString: String(filename[identifierStart..<identifierEnd])) != nil
+    }
+
+    private static func ensurePrivateDirectory(_ directory: URL) throws {
+        let manager = FileManager.default
+        if !manager.fileExists(atPath: directory.path) {
+            try manager.createDirectory(
+                at: directory,
+                withIntermediateDirectories: true,
+                attributes: [.posixPermissions: 0o700]
+            )
+        }
+        var status = stat()
+        guard directory.path.withCString({ lstat($0, &status) }) == 0 else {
+            throw SecureFileFailure.posix("无法检查安全目录", errno)
+        }
+        guard (status.st_mode & S_IFMT) == S_IFDIR, status.st_uid == getuid() else {
+            throw SecureFileFailure.invalid("安全目录不是当前用户所有的真实目录。")
+        }
+        guard directory.path.withCString({ chmod($0, 0o700) }) == 0 else {
+            throw SecureFileFailure.posix("无法设置安全目录权限", errno)
+        }
+    }
 }
 
 struct SafetyPreferences: Codable, Equatable, Sendable {
@@ -1376,6 +1963,26 @@ struct DestructiveConfirmationRequest: Codable, Equatable, Sendable {
     let paths: [String]
     let confirmationMode: DestructiveConfirmationMode
     let replySocketPath: String
+    let containingHostBundleIdentity: HostBundleIdentity?
+
+    init(
+        id: UUID,
+        createdAt: Date,
+        action: DestructiveConfirmationAction,
+        paths: [String],
+        confirmationMode: DestructiveConfirmationMode,
+        replySocketPath: String,
+        containingHostBundleIdentity: HostBundleIdentity? =
+            HostBundleIdentity.currentContainingApplication()
+    ) {
+        self.id = id
+        self.createdAt = createdAt
+        self.action = action
+        self.paths = paths
+        self.confirmationMode = confirmationMode
+        self.replySocketPath = replySocketPath
+        self.containingHostBundleIdentity = containingHostBundleIdentity
+    }
 
     /// Binds an authenticated reply to the exact request context parsed and shown by the host.
     var authenticationDigest: Data {
@@ -1389,7 +1996,7 @@ struct DestructiveConfirmationRequest: Codable, Equatable, Sendable {
             appendField(Data(value.utf8))
         }
 
-        appendString("SuperRightClick.DestructiveConfirmationRequest.v1")
+        appendString("SuperRightClick.DestructiveConfirmationRequest.v2")
         var identifier = id.uuid
         appendField(withUnsafeBytes(of: &identifier) { Data($0) })
         var timestamp = createdAt.timeIntervalSinceReferenceDate.bitPattern.bigEndian
@@ -1400,6 +2007,15 @@ struct DestructiveConfirmationRequest: Codable, Equatable, Sendable {
         paths.forEach(appendString)
         appendString(confirmationMode.rawValue)
         appendString(replySocketPath)
+        if let containingHostBundleIdentity {
+            appendString("host-present")
+            var device = containingHostBundleIdentity.device.bigEndian
+            appendField(withUnsafeBytes(of: &device) { Data($0) })
+            var inode = containingHostBundleIdentity.inode.bigEndian
+            appendField(withUnsafeBytes(of: &inode) { Data($0) })
+        } else {
+            appendString("host-missing")
+        }
         return Data(SHA256.hash(data: canonical))
     }
 }
@@ -1408,6 +2024,126 @@ struct DestructiveConfirmationResponse: Codable, Equatable, Sendable {
     let requestID: UUID
     let requestDigest: Data
     let approved: Bool
+}
+
+/// Every response accepted from the host must identify and authenticate the exact
+/// request that caused the UI to be shown. The extension additionally verifies
+/// the peer process' code signature before decoding one of these responses.
+protocol AuthenticatedHostResponse: Codable, Sendable {
+    var requestID: UUID { get }
+    var requestDigest: Data { get }
+}
+
+extension DestructiveConfirmationResponse: AuthenticatedHostResponse { }
+
+/// Shared admission policy for modal host UI. Keeping validation work in the
+/// same budget as queued and displayed requests prevents a notification burst
+/// from creating an unbounded number of validation tasks before the queue fills.
+enum HostUIRequestAdmission {
+    static let maximumOutstanding = 32
+
+    static func canAccept(
+        validating: Int,
+        pending: Int,
+        inFlight: Int,
+        otherOutstanding: Int = 0
+    ) -> Bool {
+        let counts = [validating, pending, inFlight, otherOutstanding]
+        guard counts.allSatisfy({ $0 >= 0 }) else { return false }
+        return counts.reduce(0, +) < maximumOutstanding
+    }
+}
+
+enum TransferDestinationOperation: String, Codable, Sendable {
+    case copy
+    case move
+    case selectFolderIconImage
+}
+
+struct TransferDestinationPickerRequest: Codable, Equatable, Sendable {
+    let id: UUID
+    let createdAt: Date
+    let operation: TransferDestinationOperation
+    let sourceItemCount: Int
+    let replySocketPath: String
+    let containingHostBundleIdentity: HostBundleIdentity?
+
+    init(
+        id: UUID,
+        createdAt: Date,
+        operation: TransferDestinationOperation,
+        sourceItemCount: Int,
+        replySocketPath: String,
+        containingHostBundleIdentity: HostBundleIdentity? =
+            HostBundleIdentity.currentContainingApplication()
+    ) {
+        self.id = id
+        self.createdAt = createdAt
+        self.operation = operation
+        self.sourceItemCount = sourceItemCount
+        self.replySocketPath = replySocketPath
+        self.containingHostBundleIdentity = containingHostBundleIdentity
+    }
+
+    /// Binds the reply to the exact operation shown by the host. Source URLs are
+    /// deliberately retained by the extension and never delegated to the host.
+    var authenticationDigest: Data {
+        var canonical = Data()
+        func appendField(_ data: Data) {
+            var length = UInt64(data.count).bigEndian
+            withUnsafeBytes(of: &length) { canonical.append(contentsOf: $0) }
+            canonical.append(data)
+        }
+        func appendString(_ value: String) {
+            appendField(Data(value.utf8))
+        }
+
+        appendString("SuperRightClick.TransferDestinationPickerRequest.v2")
+        var identifier = id.uuid
+        appendField(withUnsafeBytes(of: &identifier) { Data($0) })
+        var timestamp = createdAt.timeIntervalSinceReferenceDate.bitPattern.bigEndian
+        appendField(withUnsafeBytes(of: &timestamp) { Data($0) })
+        appendString(operation.rawValue)
+        var count = UInt64(sourceItemCount).bigEndian
+        appendField(withUnsafeBytes(of: &count) { Data($0) })
+        appendString(replySocketPath)
+        if let containingHostBundleIdentity {
+            appendString("host-present")
+            var device = containingHostBundleIdentity.device.bigEndian
+            appendField(withUnsafeBytes(of: &device) { Data($0) })
+            var inode = containingHostBundleIdentity.inode.bigEndian
+            appendField(withUnsafeBytes(of: &inode) { Data($0) })
+        } else {
+            appendString("host-missing")
+        }
+        return Data(SHA256.hash(data: canonical))
+    }
+}
+
+struct TransferDestinationPickerResponse: Codable, Equatable, Sendable,
+    AuthenticatedHostResponse {
+    enum Outcome: String, Codable, Sendable {
+        case selected
+        case cancelled
+        case failed
+    }
+
+    let requestID: UUID
+    let requestDigest: Data
+    let outcome: Outcome
+    /// An implicit-scope bookmark created from the user's NSOpenPanel selection.
+    /// A raw destination path is intentionally never returned across the process boundary.
+    let destinationBookmark: Data?
+
+    var isStructurallyValid: Bool {
+        switch outcome {
+        case .selected:
+            return destinationBookmark?.isEmpty == false
+                && (destinationBookmark?.count ?? 0) <= TransferDestinationPickerBridge.maximumBookmarkSize
+        case .cancelled, .failed:
+            return destinationBookmark == nil
+        }
+    }
 }
 
 enum LocalUnixSocket {
@@ -1429,69 +2165,38 @@ enum LocalUnixSocket {
     private static let exchangeTimeout: Duration = .seconds(2)
     private static let pollIntervalMilliseconds: Int32 = 100
 
-    static func send(_ data: Data, to path: String) throws {
-        let descriptor = socket(AF_UNIX, SOCK_STREAM, 0)
-        guard descriptor >= 0 else {
-            throw SecureFileFailure.posix("无法创建本地确认连接", errno)
-        }
-        defer { _ = close(descriptor) }
-
-        let flags = fcntl(descriptor, F_GETFL)
-        guard flags >= 0,
-              fcntl(descriptor, F_SETFL, flags | O_NONBLOCK) == 0 else {
-            throw SecureFileFailure.posix("无法配置本地确认连接", errno)
-        }
-        var noSigPipe: Int32 = 1
-        guard setsockopt(
-            descriptor,
-            SOL_SOCKET,
-            SO_NOSIGPIPE,
-            &noSigPipe,
-            socklen_t(MemoryLayout<Int32>.size)
-        ) == 0 else {
-            throw SecureFileFailure.posix("无法保护本地确认连接", errno)
-        }
-
+    /// Opens a short-lived probe connection and returns the peer's signed-code
+    /// identity. Closing the probe without a payload is intentional; the server
+    /// continues accepting until the request deadline.
+    static func peerCodeHash(at path: String) throws -> Data {
         let clock = ContinuousClock()
         let deadline = clock.now.advanced(by: exchangeTimeout)
-        var (address, length) = try address(for: path)
-        let connectResult = withUnsafePointer(to: &address) { pointer in
-            pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-                connect(descriptor, $0, length)
-            }
-        }
-        if connectResult != 0 {
-            let connectError = errno
-            guard connectError == EINPROGRESS ||
-                    connectError == EALREADY ||
-                    connectError == EAGAIN ||
-                    connectError == EWOULDBLOCK ||
-                    connectError == EINTR else {
-                throw SecureFileFailure.posix("无法连接本地确认通道", connectError)
-            }
-            let events = try waitForEvents(
-                descriptor,
-                events: Int16(POLLOUT),
-                clock: clock,
-                deadline: deadline,
-                timeoutMessage: "连接本地确认通道超时。"
-            )
-            var socketError: Int32 = 0
-            var socketErrorSize = socklen_t(MemoryLayout<Int32>.size)
-            guard getsockopt(
-                descriptor,
-                SOL_SOCKET,
-                SO_ERROR,
-                &socketError,
-                &socketErrorSize
-            ) == 0 else {
-                throw SecureFileFailure.posix("无法检查本地确认连接", errno)
-            }
-            guard socketError == 0 else {
-                throw SecureFileFailure.posix("无法连接本地确认通道", socketError)
-            }
-            guard events & Int16(POLLOUT) != 0 else {
-                throw SecureFileFailure.invalid("本地确认通道连接异常。")
+        let descriptor = try connectedDescriptor(
+            to: path,
+            clock: clock,
+            deadline: deadline
+        )
+        defer { _ = close(descriptor) }
+        return try peerCodeHash(on: descriptor)
+    }
+
+    static func send(
+        _ data: Data,
+        to path: String,
+        expectedPeerCodeHash: Data? = nil
+    ) throws {
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: exchangeTimeout)
+        let descriptor = try connectedDescriptor(
+            to: path,
+            clock: clock,
+            deadline: deadline
+        )
+        defer { _ = close(descriptor) }
+
+        if let expectedPeerCodeHash {
+            guard try peerCodeHash(on: descriptor) == expectedPeerCodeHash else {
+                throw SecureFileFailure.invalid("本地确认通道对端身份无效。")
             }
         }
 
@@ -1532,6 +2237,98 @@ enum LocalUnixSocket {
             throw SecureFileFailure.posix("无法完成确认结果发送", errno)
         }
         try waitForPeerClosure(descriptor, clock: clock, deadline: deadline)
+    }
+
+    private static func connectedDescriptor(
+        to path: String,
+        clock: ContinuousClock,
+        deadline: ContinuousClock.Instant
+    ) throws -> Int32 {
+        let descriptor = socket(AF_UNIX, SOCK_STREAM, 0)
+        guard descriptor >= 0 else {
+            throw SecureFileFailure.posix("无法创建本地确认连接", errno)
+        }
+        var shouldClose = true
+        defer {
+            if shouldClose { _ = close(descriptor) }
+        }
+
+        let flags = fcntl(descriptor, F_GETFL)
+        guard flags >= 0,
+              fcntl(descriptor, F_SETFL, flags | O_NONBLOCK) == 0 else {
+            throw SecureFileFailure.posix("无法配置本地确认连接", errno)
+        }
+        var noSigPipe: Int32 = 1
+        guard setsockopt(
+            descriptor,
+            SOL_SOCKET,
+            SO_NOSIGPIPE,
+            &noSigPipe,
+            socklen_t(MemoryLayout<Int32>.size)
+        ) == 0 else {
+            throw SecureFileFailure.posix("无法保护本地确认连接", errno)
+        }
+
+        var (address, length) = try address(for: path)
+        let connectResult = withUnsafePointer(to: &address) { pointer in
+            pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                connect(descriptor, $0, length)
+            }
+        }
+        if connectResult != 0 {
+            let connectError = errno
+            guard connectError == EINPROGRESS ||
+                    connectError == EALREADY ||
+                    connectError == EAGAIN ||
+                    connectError == EWOULDBLOCK ||
+                    connectError == EINTR else {
+                throw SecureFileFailure.posix("无法连接本地确认通道", connectError)
+            }
+            let events = try waitForEvents(
+                descriptor,
+                events: Int16(POLLOUT),
+                clock: clock,
+                deadline: deadline,
+                timeoutMessage: "连接本地确认通道超时。"
+            )
+            var socketError: Int32 = 0
+            var socketErrorSize = socklen_t(MemoryLayout<Int32>.size)
+            guard getsockopt(
+                descriptor,
+                SOL_SOCKET,
+                SO_ERROR,
+                &socketError,
+                &socketErrorSize
+            ) == 0 else {
+                throw SecureFileFailure.posix("无法检查本地确认连接", errno)
+            }
+            guard socketError == 0 else {
+                throw SecureFileFailure.posix("无法连接本地确认通道", socketError)
+            }
+            guard events & Int16(POLLOUT) != 0 else {
+                throw SecureFileFailure.invalid("本地确认通道连接异常。")
+            }
+        }
+        shouldClose = false
+        return descriptor
+    }
+
+    private static func peerCodeHash(on descriptor: Int32) throws -> Data {
+        var peerPID: pid_t = 0
+        var peerPIDSize = socklen_t(MemoryLayout<pid_t>.size)
+        guard getsockopt(
+            descriptor,
+            SOL_LOCAL,
+            LOCAL_PEERPID,
+            &peerPID,
+            &peerPIDSize
+        ) == 0 else {
+            throw SecureFileFailure.posix("无法验证本地确认通道对端", errno)
+        }
+        guard let codeHash = CodeIdentity.codeHash(processIdentifier: peerPID) else {
+            throw SecureFileFailure.invalid("无法读取本地确认通道对端签名。")
+        }
+        return codeHash
     }
 
     private static func waitForPeerClosure(
@@ -1660,6 +2457,7 @@ enum DestructiveConfirmationBridge {
               request.paths.allSatisfy({ $0.hasPrefix("/") }),
               request.confirmationMode == (request.paths.count > 1 ? .typeDelete : .standard),
               request.replySocketPath.hasPrefix("/"),
+              !request.replySocketPath.contains("\0"),
               request.replySocketPath.utf8.count < 104
         else {
             throw SecureFileFailure.invalid("确认请求内容无效。")
@@ -1705,9 +2503,216 @@ enum DestructiveConfirmationBridge {
 
     static func sendResponse(
         _ response: DestructiveConfirmationResponse,
-        toSocketPath path: String
+        toSocketPath path: String,
+        expectedPeerCodeHash: Data? = nil
     ) throws {
-        try LocalUnixSocket.send(try JSONEncoder().encode(response), to: path)
+        try LocalUnixSocket.send(
+            try JSONEncoder().encode(response),
+            to: path,
+            expectedPeerCodeHash: expectedPeerCodeHash
+        )
+    }
+
+    /// Production sockets and request files must share the extension's private
+    /// temporary root. Tests can still use an injected request directory and
+    /// call `readRequest` independently of this production-only check.
+    static func hasExpectedProductionTransport(
+        _ request: DestructiveConfirmationRequest,
+        requestURL: URL
+    ) -> Bool {
+        let requestDirectory = requestURL.deletingLastPathComponent().standardizedFileURL
+        let temporaryRoot = requestDirectory.deletingLastPathComponent().standardizedFileURL
+        let socketURL = URL(fileURLWithPath: request.replySocketPath).standardizedFileURL
+        return request.containingHostBundleIdentity != nil
+            && requestDirectory.lastPathComponent ==
+                "SuperRightClick-ConfirmationRequests"
+            && socketURL.deletingLastPathComponent() == temporaryRoot
+            && socketURL.lastPathComponent.hasPrefix(".s")
+            && socketURL.lastPathComponent.count >= 6
+            && !request.replySocketPath.contains("\0")
+    }
+}
+
+/// Secure request transport for UI that must be owned by the foreground host app.
+///
+/// Distributed notifications are only a wake-up hint. The actual request is read
+/// from an owner-only file and the result is returned over an authenticated local
+/// socket. A launch argument provides the lossless cold-start path.
+enum TransferDestinationPickerBridge {
+    static let launchArgument = "--superrightclick-choose-transfer-destination"
+    static let responseTimeoutSeconds: TimeInterval = 120
+    static let responseTimeout: Duration = .seconds(120)
+    static let maximumBookmarkSize = 1024 * 1024
+
+    /// Creates a short-lived bookmark for an immediate, authenticated IPC
+    /// handoff. A bookmark without an explicit security scope preserves the
+    /// ephemeral scope supplied by the open panel and can be consumed by the
+    /// separately sandboxed Finder extension.
+    static func makeEphemeralBookmark(for url: URL) throws -> Data {
+        try url.bookmarkData(
+            options: [.minimalBookmark],
+            includingResourceValuesForKeys: nil,
+            relativeTo: nil
+        )
+    }
+
+    /// Resolves a one-shot interprocess bookmark. A stale bookmark still
+    /// returns a usable, relocated URL; staleness only means a persisted copy
+    /// should be regenerated. These bookmarks are never persisted, so callers
+    /// must validate the returned resource itself instead of rejecting it only
+    /// because `wasStale` is true.
+    static func resolveEphemeralBookmark(
+        _ bookmark: Data
+    ) throws -> (url: URL, wasStale: Bool) {
+        var wasStale = false
+        let url = try URL(
+            resolvingBookmarkData: bookmark,
+            options: [.withoutUI],
+            relativeTo: nil,
+            bookmarkDataIsStale: &wasStale
+        )
+        return (url, wasStale)
+    }
+
+    private static let requestNotification = Notification.Name(
+        "local.SuperRightClick.transferDestinationPicker.request"
+    )
+    private static let requestPrefix = "transfer-destination-"
+    private static let requestSuffix = ".json"
+
+    static func remainingResponseLifetime(
+        for request: TransferDestinationPickerRequest,
+        now: Date = Date()
+    ) -> TimeInterval {
+        min(
+            responseTimeoutSeconds,
+            responseTimeoutSeconds - now.timeIntervalSince(request.createdAt)
+        )
+    }
+
+    static func makeRequest(
+        operation: TransferDestinationOperation,
+        sourceItemCount: Int,
+        replySocketPath: String
+    ) -> TransferDestinationPickerRequest {
+        TransferDestinationPickerRequest(
+            id: UUID(),
+            createdAt: Date(),
+            operation: operation,
+            sourceItemCount: sourceItemCount,
+            replySocketPath: replySocketPath
+        )
+    }
+
+    static func writeRequest(
+        _ request: TransferDestinationPickerRequest,
+        directoryURL: URL? = nil
+    ) throws -> URL {
+        let directory = directoryURL ?? FileManager.default.temporaryDirectory
+            .appendingPathComponent("SuperRightClick-HostUIRequests", isDirectory: true)
+        let url = directory.appendingPathComponent(
+            "\(requestPrefix)\(request.id.uuidString)\(requestSuffix)"
+        )
+        try SecureJSONFile.writeExclusive(try JSONEncoder().encode(request), to: url)
+        return url
+    }
+
+    static func readRequest(
+        at url: URL,
+        now: Date = Date()
+    ) throws -> TransferDestinationPickerRequest {
+        try SecureJSONFile.validatePrivateDirectory(url.deletingLastPathComponent())
+        let data = try SecureJSONFile.read(url, maximumSize: 64 * 1024)
+        let request = try JSONDecoder().decode(TransferDestinationPickerRequest.self, from: data)
+        guard url.lastPathComponent ==
+                "\(requestPrefix)\(request.id.uuidString)\(requestSuffix)" else {
+            throw SecureFileFailure.invalid("目录选择请求文件名与请求 ID 不匹配。")
+        }
+        let age = now.timeIntervalSince(request.createdAt)
+        guard age >= -5, age < responseTimeoutSeconds else {
+            throw SecureFileFailure.invalid("目录选择请求已过期。")
+        }
+        guard request.sourceItemCount > 0,
+              request.sourceItemCount <= 100_000,
+              request.replySocketPath.hasPrefix("/"),
+              !request.replySocketPath.contains("\0"),
+              request.replySocketPath.utf8.count < 104 else {
+            throw SecureFileFailure.invalid("目录选择请求内容无效。")
+        }
+        return request
+    }
+
+    /// Production requests put the socket beside the fixed private request
+    /// directory in the extension's temporary container. Tests may inject a
+    /// different directory and therefore call `readRequest` without this check.
+    static func hasExpectedProductionTransport(
+        _ request: TransferDestinationPickerRequest,
+        requestURL: URL
+    ) -> Bool {
+        let requestDirectory = requestURL.deletingLastPathComponent().standardizedFileURL
+        let temporaryRoot = requestDirectory.deletingLastPathComponent().standardizedFileURL
+        let socketURL = URL(fileURLWithPath: request.replySocketPath).standardizedFileURL
+        return request.containingHostBundleIdentity != nil
+            && requestDirectory.lastPathComponent == "SuperRightClick-HostUIRequests"
+            && socketURL.deletingLastPathComponent() == temporaryRoot
+            && socketURL.lastPathComponent.hasPrefix(".s")
+            && socketURL.lastPathComponent.count >= 6
+            && !request.replySocketPath.contains("\0")
+    }
+
+    static func requestID(from url: URL) -> UUID? {
+        let name = url.lastPathComponent
+        guard name.hasPrefix(requestPrefix), name.hasSuffix(requestSuffix) else { return nil }
+        let start = name.index(name.startIndex, offsetBy: requestPrefix.count)
+        let end = name.index(name.endIndex, offsetBy: -requestSuffix.count)
+        return UUID(uuidString: String(name[start..<end]))
+    }
+
+    static func removeRequest(at url: URL) {
+        try? FileManager.default.removeItem(at: url)
+    }
+
+    static func postRequest(at url: URL) {
+        DistributedNotificationCenter.default().postNotificationName(
+            requestNotification,
+            object: url.path,
+            userInfo: nil,
+            deliverImmediately: true
+        )
+    }
+
+    static func observeRequests(
+        handler: @escaping @MainActor @Sendable (URL) -> Void
+    ) -> NSObjectProtocol {
+        DistributedNotificationCenter.default().addObserver(
+            forName: requestNotification,
+            object: nil,
+            queue: .main
+        ) { notification in
+            guard let path = notification.object as? String else { return }
+            MainActor.assumeIsolated {
+                handler(URL(fileURLWithPath: path).standardizedFileURL)
+            }
+        }
+    }
+
+    static func sendResponse(
+        _ response: TransferDestinationPickerResponse,
+        toSocketPath path: String,
+        expectedPeerCodeHash: Data? = nil
+    ) throws {
+        guard response.isStructurallyValid else {
+            throw SecureFileFailure.invalid("目录选择响应内容无效。")
+        }
+        let data = try JSONEncoder().encode(response)
+        guard data.count <= maximumBookmarkSize + 64 * 1024 else {
+            throw SecureFileFailure.invalid("目录选择响应过大。")
+        }
+        try LocalUnixSocket.send(
+            data,
+            to: path,
+            expectedPeerCodeHash: expectedPeerCodeHash
+        )
     }
 }
 
@@ -1758,8 +2763,42 @@ final class NotificationObservationBag: @unchecked Sendable {
     }
 }
 
+/// A caller-owned view of the authoritative configuration. The revision travels
+/// with the exact value that was loaded; unrelated loads in the same process
+/// cannot advance another editor's compare-and-swap token.
+struct ConfigurationSnapshot: Sendable, Equatable {
+    let configuration: MenuConfiguration
+    fileprivate let revision: String?
+    fileprivate let isSharedStore: Bool
+    let isAuthoritative: Bool
+}
+
+struct ExtensionLegacyMigrationResult: Sendable {
+    let snapshot: ConfigurationSnapshot
+    let isComplete: Bool
+}
+
+enum ConfigurationSaveResult: Sendable {
+    case saved(ConfigurationSnapshot)
+    case unchanged(ConfigurationSnapshot)
+    case conflict(ConfigurationSnapshot?)
+    case unavailable
+
+    var committedSnapshot: ConfigurationSnapshot? {
+        switch self {
+        case let .saved(snapshot), let .unchanged(snapshot): snapshot
+        case .conflict, .unavailable: nil
+        }
+    }
+}
+
 enum ConfigurationStore {
     private static let key = "menuConfiguration.v2"
+    private static let isolatedRevisionKey = "menuConfiguration.v2.revision"
+    private static let extensionLegacyMigrationKey = "menuConfiguration.sharedMigration.v1"
+    private static let schemaVersion = 1
+    private static let maximumConfigurationSize = 4 * 1024 * 1024
+    private static let hostBundleIdentifier = "local.SuperRightClick"
     private static let updateNotification = Notification.Name("local.SuperRightClick.configuration.updated")
     private static let localUpdateNotification = Notification.Name(
         "local.SuperRightClick.configuration.updatedInProcess"
@@ -1776,60 +2815,324 @@ enum ConfigurationStore {
     private static let templateImportRequestNotification = Notification.Name(
         "local.SuperRightClick.template.import"
     )
+    private static let isolatedDefaultsLock = NSLock()
+
+    /// 不把存储元数据塞进 MenuConfiguration，避免影响 SwiftUI 的值比较。
+    /// revision 在文件锁内作为 CAS token，使迟到的写入只会失败，
+    /// 不会静默覆盖另一进程已经提交的新版本。
+    private struct StoredEnvelope: Codable, Sendable {
+        var schemaVersion: Int
+        var revision: String
+        var updatedAt: Date
+        var writerIdentifier: String
+        var configuration: MenuConfiguration
+    }
+
+    private static var sharedDirectoryURL: URL {
+        UserPaths.homeDirectory
+            .appendingPathComponent("Library/Application Support", isDirectory: true)
+            .appendingPathComponent("SuperRightClick", isDirectory: true)
+    }
+
+    private static var sharedFileURL: URL {
+        sharedDirectoryURL.appendingPathComponent("MenuConfiguration.json")
+    }
+
+    private static var sharedLockFileURL: URL {
+        sharedDirectoryURL.appendingPathComponent(".MenuConfiguration.lock")
+    }
+
+    private static func usesSharedStore(_ defaults: UserDefaults) -> Bool {
+        defaults === UserDefaults.standard
+    }
 
     static func hasStoredConfiguration(defaults: UserDefaults = .standard) -> Bool {
-        defaults.data(forKey: key) != nil
+        guard usesSharedStore(defaults) else {
+            return defaults.data(forKey: key) != nil
+        }
+        return (try? withSharedFileLock {
+            try readSharedEnvelopeLocked() != nil
+        }) ?? false
     }
 
     static func load(defaults: UserDefaults = .standard) -> MenuConfiguration {
-        guard let data = defaults.data(forKey: key),
-              var value = try? JSONDecoder().decode(MenuConfiguration.self, from: data) else {
-            return .default
-        }
-        value.deduplicateTemplates()
-        return value
+        loadSnapshot(defaults: defaults).configuration
     }
 
+    static func loadSnapshot(
+        defaults: UserDefaults = .standard
+    ) -> ConfigurationSnapshot {
+        guard usesSharedStore(defaults) else {
+            isolatedDefaultsLock.lock()
+            defer { isolatedDefaultsLock.unlock() }
+            return isolatedSnapshotLocked(defaults: defaults)
+        }
+
+        let legacy = loadLegacy(defaults: defaults) ?? .default
+        do {
+            return try withSharedFileLock {
+                if let envelope = try readSharedEnvelopeLocked() {
+                    return snapshot(for: envelope)
+                }
+
+                // Only the containing app may choose which target's legacy
+                // UserDefaults domain becomes authoritative during migration.
+                guard Bundle.main.bundleIdentifier == hostBundleIdentifier else {
+                    return ConfigurationSnapshot(
+                        configuration: legacy,
+                        revision: nil,
+                        isSharedStore: true,
+                        isAuthoritative: false
+                    )
+                }
+                let envelope = makeEnvelope(configuration: legacy)
+                try writeSharedEnvelopeLocked(envelope)
+                return snapshot(for: envelope)
+            }
+        } catch {
+            // The fallback is safe for display/menu continuity, but is explicitly
+            // non-authoritative. Observers must never use it for template GC or
+            // as the baseline of a write.
+            return ConfigurationSnapshot(
+                configuration: legacy,
+                revision: nil,
+                isSharedStore: true,
+                isAuthoritative: false
+            )
+        }
+    }
+
+    /// Compatibility API for isolated test UserDefaults. Production shared
+    /// writes must use `save(_:basedOn:)` so a stale editor cannot borrow a
+    /// revision advanced by another object in the same process.
     @discardableResult
     static func save(
         _ configuration: MenuConfiguration,
         defaults: UserDefaults = .standard,
         publish: Bool = true
     ) -> Bool {
-        guard let data = try? JSONEncoder().encode(configuration) else { return false }
-        defaults.set(data, forKey: key)
+        guard !usesSharedStore(defaults) else { return false }
+        let baseline = loadSnapshot(defaults: defaults)
+        return save(
+            configuration,
+            basedOn: baseline,
+            defaults: defaults,
+            publish: publish
+        ).committedSnapshot != nil
+    }
 
-        // 进程内状态不经过 DistributedNotificationCenter，避免自身来源过滤
-        // 导致菜单栏图标等 App 生命周期状态只能在重启后刷新。
-        NotificationCenter.default.post(
-            name: localUpdateNotification,
-            object: configuration
-        )
+    @discardableResult
+    static func save(
+        _ configuration: MenuConfiguration,
+        basedOn baseline: ConfigurationSnapshot,
+        defaults: UserDefaults = .standard,
+        publish: Bool = true
+    ) -> ConfigurationSaveResult {
+        guard configuration.imageQuality.isFinite,
+              configuration.isWithinStorageCapacity else { return .unavailable }
+        let normalized = configuration.validatedAndNormalized()
+        guard let encoded = try? JSONEncoder().encode(normalized),
+              encoded.count <= maximumConfigurationSize else { return .unavailable }
 
-        if publish {
-            let source = Bundle.main.bundleIdentifier ?? "unknown"
-            let payload = "\(source)|\(data.base64EncodedString())"
-            DistributedNotificationCenter.default().postNotificationName(
-                updateNotification,
-                object: payload,
-                userInfo: nil,
-                deliverImmediately: true
+        guard usesSharedStore(defaults) else {
+            guard !baseline.isSharedStore, baseline.isAuthoritative,
+                  let expectedRevision = baseline.revision else { return .unavailable }
+            isolatedDefaultsLock.lock()
+            defer { isolatedDefaultsLock.unlock() }
+            let current = isolatedSnapshotLocked(defaults: defaults)
+            if current.configuration == normalized {
+                return .unchanged(current)
+            }
+            guard current.revision == expectedRevision else { return .conflict(current) }
+            let revision = UUID().uuidString
+            defaults.set(encoded, forKey: key)
+            defaults.set(revision, forKey: isolatedRevisionKey)
+            // Isolated stores never emit process/global notifications; tests and
+            // previews cannot wake production observers by accident.
+            return .saved(ConfigurationSnapshot(
+                configuration: normalized,
+                revision: revision,
+                isSharedStore: false,
+                isAuthoritative: true
+            ))
+        }
+        guard baseline.isSharedStore, baseline.isAuthoritative,
+              let expectedRevision = baseline.revision else { return .unavailable }
+
+        let result: ConfigurationSaveResult
+        do {
+            result = try withSharedFileLock {
+                guard let envelope = try readSharedEnvelopeLocked() else {
+                    return .conflict(nil)
+                }
+                let current = snapshot(for: envelope)
+                if current.configuration == normalized {
+                    return .unchanged(current)
+                }
+                guard envelope.revision == expectedRevision else {
+                    return .conflict(current)
+                }
+                let replacement = makeEnvelope(configuration: normalized)
+                try writeSharedEnvelopeLocked(replacement)
+                return .saved(snapshot(for: replacement))
+            }
+        } catch {
+            return .unavailable
+        }
+
+        if case .saved = result {
+            postLocalWake()
+            if publish { postConfigurationWake() }
+        }
+        return result
+    }
+
+    /// Merge only data that historically lived solely in the Finder extension's
+    /// preferences domain. Current shared values win conflicts; legacy entries
+    /// are appended in their existing order. `nil` means every unique entry
+    /// cannot be represented without crossing a configured capacity boundary.
+    static func mergingLegacyExtensionAdditions(
+        _ legacyConfiguration: MenuConfiguration,
+        into sharedConfiguration: MenuConfiguration
+    ) -> MenuConfiguration? {
+        guard legacyConfiguration.isWithinStorageCapacity,
+              sharedConfiguration.isWithinStorageCapacity else { return nil }
+        let legacy = legacyConfiguration.validatedAndNormalized()
+        var merged = sharedConfiguration.validatedAndNormalized()
+
+        var templateIDs = Set(merged.templates.map(\.id))
+        var templateKeys = Set(merged.templates.map {
+            "\($0.name.lowercased())|\($0.fileExtension.lowercased())"
+        })
+        for template in legacy.templates where template.kind == .custom {
+            guard let filename = template.storedFilename,
+                  MenuConfiguration.isValidStoredTemplateFilename(filename) else { continue }
+            let key = "\(template.name.lowercased())|\(template.fileExtension.lowercased())"
+            guard !templateIDs.contains(template.id), !templateKeys.contains(key) else { continue }
+            guard merged.templates.count < MenuConfiguration.maximumTemplateCount else {
+                return nil
+            }
+            merged.templates.append(template)
+            templateIDs.insert(template.id)
+            templateKeys.insert(key)
+        }
+
+        var commonPaths = Set(merged.commonDirectories.map {
+            $0.resolvedURL.standardizedFileURL.path
+        })
+        var commonIDs = Set(merged.commonDirectories.map(\.id))
+        for directory in legacy.commonDirectories {
+            let path = directory.resolvedURL.standardizedFileURL.path
+            // A legacy row with the same stable identity never replaces the
+            // authoritative shared row, even if its path was edited separately.
+            guard !commonIDs.contains(directory.id), !commonPaths.contains(path) else { continue }
+            guard merged.commonDirectories.count < MenuConfiguration.maximumDirectoryCount else {
+                return nil
+            }
+            merged.commonDirectories.append(directory)
+            commonIDs.insert(directory.id)
+            commonPaths.insert(path)
+        }
+        return merged.validatedAndNormalized()
+    }
+
+    /// One-shot extension-domain migration. The marker is written only after a
+    /// successful CAS (or after proving the shared value already contains every
+    /// addition). A crash between commit and marker is harmless: the next retry
+    /// observes an unchanged value and then writes the marker.
+    static func migrateLegacyExtensionAdditions(
+        basedOn baseline: ConfigurationSnapshot,
+        defaults: UserDefaults = .standard,
+        publish: Bool = true
+    ) -> ExtensionLegacyMigrationResult {
+        guard usesSharedStore(defaults) else {
+            return ExtensionLegacyMigrationResult(snapshot: baseline, isComplete: true)
+        }
+        if defaults.string(forKey: extensionLegacyMigrationKey) != nil {
+            return ExtensionLegacyMigrationResult(snapshot: baseline, isComplete: true)
+        }
+        guard baseline.isSharedStore, baseline.isAuthoritative else {
+            return ExtensionLegacyMigrationResult(snapshot: baseline, isComplete: false)
+        }
+
+        guard let legacyData = defaults.data(forKey: key) else {
+            return ExtensionLegacyMigrationResult(
+                snapshot: baseline,
+                isComplete: markExtensionLegacyMigrationComplete(
+                    at: baseline,
+                    defaults: defaults
+                )
             )
         }
-        return true
+        guard legacyData.count <= maximumConfigurationSize,
+              let decodedLegacy = try? JSONDecoder().decode(
+                MenuConfiguration.self,
+                from: legacyData
+              ),
+              decodedLegacy.imageQuality.isFinite,
+              decodedLegacy.isWithinStorageCapacity else {
+            return ExtensionLegacyMigrationResult(snapshot: baseline, isComplete: false)
+        }
+
+        var workingSnapshot = baseline
+        for _ in 0..<3 {
+            guard let merged = mergingLegacyExtensionAdditions(
+                decodedLegacy,
+                into: workingSnapshot.configuration
+            ) else {
+                return ExtensionLegacyMigrationResult(
+                    snapshot: workingSnapshot,
+                    isComplete: false
+                )
+            }
+            let result = save(
+                merged,
+                basedOn: workingSnapshot,
+                defaults: defaults,
+                publish: publish
+            )
+            if let committed = result.committedSnapshot {
+                return ExtensionLegacyMigrationResult(
+                    snapshot: committed,
+                    isComplete: markExtensionLegacyMigrationComplete(
+                        at: committed,
+                        defaults: defaults
+                    )
+                )
+            }
+            if case let .conflict(latest?) = result {
+                workingSnapshot = latest
+                continue
+            }
+            return ExtensionLegacyMigrationResult(
+                snapshot: workingSnapshot,
+                isComplete: false
+            )
+        }
+        return ExtensionLegacyMigrationResult(snapshot: workingSnapshot, isComplete: false)
     }
 
     static func observeLocalUpdates(
+        defaults: UserDefaults = .standard,
         handler: @escaping @MainActor @Sendable (MenuConfiguration) -> Void
+    ) -> NSObjectProtocol {
+        observeLocalSnapshots(defaults: defaults) { snapshot in
+            guard snapshot.isAuthoritative else { return }
+            handler(snapshot.configuration)
+        }
+    }
+
+    static func observeLocalSnapshots(
+        defaults: UserDefaults = .standard,
+        handler: @escaping @MainActor @Sendable (ConfigurationSnapshot) -> Void
     ) -> NSObjectProtocol {
         NotificationCenter.default.addObserver(
             forName: localUpdateNotification,
             object: nil,
             queue: .main
-        ) { notification in
-            guard let configuration = notification.object as? MenuConfiguration else { return }
+        ) { _ in
             MainActor.assumeIsolated {
-                handler(configuration)
+                handler(loadSnapshot(defaults: defaults))
             }
         }
     }
@@ -1838,24 +3141,28 @@ enum ConfigurationStore {
         defaults: UserDefaults = .standard,
         handler: @escaping @MainActor @Sendable (MenuConfiguration) -> Void
     ) -> NSObjectProtocol {
+        observeSnapshotUpdates(defaults: defaults) { snapshot in
+            handler(snapshot.configuration)
+        }
+    }
+
+    static func observeSnapshotUpdates(
+        defaults: UserDefaults = .standard,
+        handler: @escaping @MainActor @Sendable (ConfigurationSnapshot) -> Void
+    ) -> NSObjectProtocol {
         DistributedNotificationCenter.default().addObserver(
             forName: updateNotification,
             object: nil,
             queue: .main
-        ) { notification in
-            guard let payload = notification.object as? String,
-                  let separator = payload.firstIndex(of: "|") else { return }
-            let source = String(payload[..<separator])
-            guard source != Bundle.main.bundleIdentifier else { return }
-            let encoded = String(payload[payload.index(after: separator)...])
-            guard let data = Data(base64Encoded: encoded),
-                  var configuration = try? JSONDecoder().decode(MenuConfiguration.self, from: data)
-            else { return }
-            configuration.deduplicateTemplates()
-            configuration.mergeMissingDefaults()
+        ) { _ in
             MainActor.assumeIsolated {
-                guard save(configuration, defaults: defaults, publish: false) else { return }
-                handler(configuration)
+                // Do not filter notifications from this bundle: Finder may host
+                // multiple extension instances whose in-memory coordinators all
+                // need the newly committed snapshot.
+                let snapshot = loadSnapshot(defaults: defaults)
+                guard snapshot.isAuthoritative else { return }
+                postLocalWake()
+                handler(snapshot)
             }
         }
     }
@@ -1948,9 +3255,152 @@ enum ConfigurationStore {
             queue: .main
         ) { _ in
             MainActor.assumeIsolated {
-                _ = save(load(defaults: defaults), defaults: defaults, publish: true)
+                // 请求和响应都只是唤醒信号；权威值始终来自共享文件。
+                let snapshot = loadSnapshot(defaults: defaults)
+                if snapshot.isAuthoritative { postConfigurationWake() }
             }
         }
+    }
+
+    private static func loadLegacy(defaults: UserDefaults) -> MenuConfiguration? {
+        guard let data = defaults.data(forKey: key),
+              data.count <= maximumConfigurationSize,
+              let value = try? JSONDecoder().decode(MenuConfiguration.self, from: data),
+              value.imageQuality.isFinite else { return nil }
+        return value.validatedAndNormalized()
+    }
+
+    private static func isolatedSnapshotLocked(
+        defaults: UserDefaults
+    ) -> ConfigurationSnapshot {
+        let data = defaults.data(forKey: key)
+        let revision: String
+        if let storedRevision = defaults.string(forKey: isolatedRevisionKey),
+           UUID(uuidString: storedRevision) != nil {
+            revision = storedRevision
+        } else if let data {
+            revision = SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+        } else {
+            revision = "empty"
+        }
+        return ConfigurationSnapshot(
+            configuration: loadLegacy(defaults: defaults) ?? .default,
+            revision: revision,
+            isSharedStore: false,
+            isAuthoritative: true
+        )
+    }
+
+    private static func markExtensionLegacyMigrationComplete(
+        at snapshot: ConfigurationSnapshot,
+        defaults: UserDefaults
+    ) -> Bool {
+        guard snapshot.isSharedStore, snapshot.isAuthoritative,
+              let revision = snapshot.revision else { return false }
+        defaults.set(revision, forKey: extensionLegacyMigrationKey)
+        return defaults.string(forKey: extensionLegacyMigrationKey) == revision
+    }
+
+    private static func makeEnvelope(configuration: MenuConfiguration) -> StoredEnvelope {
+        StoredEnvelope(
+            schemaVersion: schemaVersion,
+            revision: UUID().uuidString,
+            updatedAt: Date(),
+            writerIdentifier: Bundle.main.bundleIdentifier ?? "unknown",
+            configuration: configuration.validatedAndNormalized()
+        )
+    }
+
+    private static func snapshot(for envelope: StoredEnvelope) -> ConfigurationSnapshot {
+        ConfigurationSnapshot(
+            configuration: envelope.configuration.validatedAndNormalized(),
+            revision: envelope.revision,
+            isSharedStore: true,
+            isAuthoritative: true
+        )
+    }
+
+    private static func readSharedEnvelopeLocked() throws -> StoredEnvelope? {
+        guard FileManager.default.fileExists(atPath: sharedFileURL.path) else { return nil }
+        let data = try SecureJSONFile.read(
+            sharedFileURL,
+            maximumSize: maximumConfigurationSize
+        )
+        if var envelope = try? JSONDecoder().decode(StoredEnvelope.self, from: data) {
+            guard envelope.schemaVersion == schemaVersion,
+                  UUID(uuidString: envelope.revision) != nil,
+                  envelope.configuration.imageQuality.isFinite else {
+                throw SecureFileFailure.invalid("共享配置元数据无效。")
+            }
+            envelope.configuration = envelope.configuration.validatedAndNormalized()
+            return envelope
+        }
+
+        // 为早期预览版可能写入的“裸 MenuConfiguration JSON”保留一次
+        // 无损迁移路径。内容摘要是稳定的临时 CAS token，下次写入会升级为 envelope。
+        guard let configuration = try? JSONDecoder().decode(MenuConfiguration.self, from: data),
+              configuration.imageQuality.isFinite else {
+            throw SecureFileFailure.invalid("共享配置文件无效。")
+        }
+        let digest = SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+        return StoredEnvelope(
+            schemaVersion: schemaVersion,
+            revision: digest,
+            updatedAt: .distantPast,
+            writerIdentifier: "legacy-shared-file",
+            configuration: configuration.validatedAndNormalized()
+        )
+    }
+
+    private static func writeSharedEnvelopeLocked(_ envelope: StoredEnvelope) throws {
+        let data = try JSONEncoder().encode(envelope)
+        guard data.count <= maximumConfigurationSize else {
+            throw SecureFileFailure.invalid("共享配置文件过大。")
+        }
+        try SecureJSONFile.writeReplacing(data, to: sharedFileURL)
+    }
+
+    private static func withSharedFileLock<T>(_ body: () throws -> T) throws -> T {
+        try SecureJSONFile.ensurePrivateDirectory(sharedDirectoryURL)
+        let descriptor = sharedLockFileURL.path.withCString {
+            open($0, O_CREAT | O_RDWR | O_NOFOLLOW, mode_t(0o600))
+        }
+        guard descriptor >= 0 else {
+            throw SecureFileFailure.posix("无法打开共享配置锁", errno)
+        }
+        defer { _ = close(descriptor) }
+        guard fchmod(descriptor, mode_t(0o600)) == 0 else {
+            throw SecureFileFailure.posix("无法设置共享配置锁权限", errno)
+        }
+        var status = stat()
+        guard fstat(descriptor, &status) == 0 else {
+            throw SecureFileFailure.posix("无法检查共享配置锁", errno)
+        }
+        guard (status.st_mode & S_IFMT) == S_IFREG,
+              status.st_uid == getuid(),
+              status.st_nlink == 1,
+              status.st_mode & mode_t(0o077) == 0 else {
+            throw SecureFileFailure.invalid("共享配置锁的类型、所有者或权限无效。")
+        }
+        while flock(descriptor, LOCK_EX) != 0 {
+            if errno == EINTR { continue }
+            throw SecureFileFailure.posix("无法锁定共享配置", errno)
+        }
+        defer { _ = flock(descriptor, LOCK_UN) }
+        return try body()
+    }
+
+    private static func postLocalWake() {
+        NotificationCenter.default.post(name: localUpdateNotification, object: nil)
+    }
+
+    private static func postConfigurationWake() {
+        DistributedNotificationCenter.default().postNotificationName(
+            updateNotification,
+            object: Bundle.main.bundleIdentifier ?? "unknown",
+            userInfo: nil,
+            deliverImmediately: true
+        )
     }
 }
 

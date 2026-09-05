@@ -24,6 +24,9 @@
 		A0000000000000000000007E /* MenuBuilder.swift in Sources */ = {isa = PBXBuildFile; fileRef = A00000000000000000000063 /* MenuBuilder.swift */; };
 		A00000000000000000000088 /* InfoPlist.strings in Resources */ = {isa = PBXBuildFile; fileRef = A00000000000000000000080 /* InfoPlist.strings */; };
 		A00000000000000000000089 /* InfoPlist.strings in Resources */ = {isa = PBXBuildFile; fileRef = A00000000000000000000084 /* InfoPlist.strings */; };
+		A00000000000000000000091 /* ConfigurationSecurityTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A00000000000000000000094 /* ConfigurationSecurityTests.swift */; };
+		A00000000000000000000092 /* HostUIBridgeTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A00000000000000000000095 /* HostUIBridgeTests.swift */; };
+		A00000000000000000000093 /* FileOperationsRegressionTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A00000000000000000000096 /* FileOperationsRegressionTests.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -72,6 +75,9 @@
 		A00000000000000000000085 /* en */ = {isa = PBXFileReference; lastKnownFileType = text.plist.strings; name = en; path = en.lproj/InfoPlist.strings; sourceTree = "<group>"; };
 		A00000000000000000000086 /* zh-Hans */ = {isa = PBXFileReference; lastKnownFileType = text.plist.strings; name = "zh-Hans"; path = zh-Hans.lproj/InfoPlist.strings; sourceTree = "<group>"; };
 		A00000000000000000000087 /* zh-Hant */ = {isa = PBXFileReference; lastKnownFileType = text.plist.strings; name = "zh-Hant"; path = zh-Hant.lproj/InfoPlist.strings; sourceTree = "<group>"; };
+		A00000000000000000000094 /* ConfigurationSecurityTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ConfigurationSecurityTests.swift; sourceTree = "<group>"; };
+		A00000000000000000000095 /* HostUIBridgeTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HostUIBridgeTests.swift; sourceTree = "<group>"; };
+		A00000000000000000000096 /* FileOperationsRegressionTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FileOperationsRegressionTests.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXVariantGroup section */
@@ -192,6 +198,9 @@
 			isa = PBXGroup;
 			children = (
 				A00000000000000000000074 /* CoreTests.swift */,
+				A00000000000000000000094 /* ConfigurationSecurityTests.swift */,
+				A00000000000000000000095 /* HostUIBridgeTests.swift */,
+				A00000000000000000000096 /* FileOperationsRegressionTests.swift */,
 			);
 			path = Tests;
 			sourceTree = "<group>";
@@ -351,6 +360,9 @@
 			buildActionMask = 2147483647;
 			files = (
 				A00000000000000000000070 /* CoreTests.swift in Sources */,
+				A00000000000000000000091 /* ConfigurationSecurityTests.swift in Sources */,
+				A00000000000000000000092 /* HostUIBridgeTests.swift in Sources */,
+				A00000000000000000000093 /* FileOperationsRegressionTests.swift in Sources */,
 				A00000000000000000000071 /* MenuAction.swift in Sources */,
 				A00000000000000000000072 /* FeatureServices.swift in Sources */,
 				A0000000000000000000007E /* MenuBuilder.swift in Sources */,
@@ -463,7 +475,7 @@
 				CODE_SIGN_IDENTITY = "-";
 				CODE_SIGN_STYLE = Manual;
 				COMBINE_HIDPI_IMAGES = YES;
-				CURRENT_PROJECT_VERSION = 1;
+				CURRENT_PROJECT_VERSION = 2;
 				ENABLE_APP_SANDBOX = NO;
 				ENABLE_HARDENED_RUNTIME = YES;
 				GENERATE_INFOPLIST_FILE = NO;
@@ -486,7 +498,7 @@
 				CODE_SIGN_IDENTITY = "-";
 				CODE_SIGN_STYLE = Manual;
 				COMBINE_HIDPI_IMAGES = YES;
-				CURRENT_PROJECT_VERSION = 1;
+				CURRENT_PROJECT_VERSION = 2;
 				ENABLE_APP_SANDBOX = NO;
 				ENABLE_HARDENED_RUNTIME = YES;
 				GENERATE_INFOPLIST_FILE = NO;
@@ -510,7 +522,7 @@
 				CODE_SIGN_ENTITLEMENTS = FinderExtension/FinderExtension.entitlements;
 				CODE_SIGN_IDENTITY = "-";
 				CODE_SIGN_STYLE = Manual;
-				CURRENT_PROJECT_VERSION = 1;
+				CURRENT_PROJECT_VERSION = 2;
 				ENABLE_APP_SANDBOX = YES;
 				ENABLE_HARDENED_RUNTIME = YES;
 				GENERATE_INFOPLIST_FILE = NO;
@@ -536,7 +548,7 @@
 				CODE_SIGN_ENTITLEMENTS = FinderExtension/FinderExtension.entitlements;
 				CODE_SIGN_IDENTITY = "-";
 				CODE_SIGN_STYLE = Manual;
-				CURRENT_PROJECT_VERSION = 1;
+				CURRENT_PROJECT_VERSION = 2;
 				ENABLE_APP_SANDBOX = YES;
 				ENABLE_HARDENED_RUNTIME = YES;
 				GENERATE_INFOPLIST_FILE = NO;

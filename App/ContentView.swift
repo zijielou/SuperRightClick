@@ -6,34 +6,181 @@ import UniformTypeIdentifiers
 final class SettingsModel: ObservableObject {
     @Published var configuration: MenuConfiguration
     @Published private(set) var safetyPreferences: SafetyPreferences
+    @Published private(set) var hasPendingConfigurationConflict = false
     private let observers = NotificationObservationBag()
     private let safetyPreferencesStore: SafetyPreferencesStore
+    private let configurationDefaults: UserDefaults
+    private let publishConfigurationChanges: Bool
     private var lastSavedConfiguration: MenuConfiguration
+    private var configurationSnapshot: ConfigurationSnapshot
+    private var pendingSaveTask: Task<Void, Never>?
+    private var conflictedDraft: MenuConfiguration?
+    private var isSavingConfiguration = false
 
-    init(safetyPreferencesStore: SafetyPreferencesStore = .production) {
+    init(
+        safetyPreferencesStore: SafetyPreferencesStore = .production,
+        configurationDefaults: UserDefaults = .standard,
+        publishConfigurationChanges: Bool = true
+    ) {
         self.safetyPreferencesStore = safetyPreferencesStore
-        let initialConfiguration = ConfigurationStore.load()
+        self.configurationDefaults = configurationDefaults
+        self.publishConfigurationChanges = publishConfigurationChanges
+        let initialSnapshot = ConfigurationStore.loadSnapshot(defaults: configurationDefaults)
+        let initialConfiguration = initialSnapshot.configuration
         configuration = initialConfiguration
+        configurationSnapshot = initialSnapshot
         safetyPreferences = safetyPreferencesStore.load()
         lastSavedConfiguration = initialConfiguration
-        observers.addLocal(ConfigurationStore.observeLocalUpdates { [weak self] value in
+        observers.addLocal(ConfigurationStore.observeLocalSnapshots(
+            defaults: configurationDefaults
+        ) { [weak self] snapshot in
             guard let self else { return }
-            // 已成功持久化的进程内或外部同步值直接成为新快照，避免
-            // SwiftUI onChange 把相同配置再次广播给 Finder 扩展。
-            self.lastSavedConfiguration = value
-            self.configuration = value
+            self.receiveExternalSnapshot(snapshot)
         })
         observers.addLocal(SafetyPreferencesStore.observeLocalUpdates { [weak self] value in
             self?.safetyPreferences = value
         })
+        observers.addLocal(NotificationCenter.default.addObserver(
+            forName: NSApplication.willTerminateNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated { _ = self?.save() }
+        })
         ConfigurationStore.requestExtensionConfiguration()
     }
 
-    func save() {
-        guard configuration != lastSavedConfiguration else { return }
-        let value = configuration
-        if ConfigurationStore.save(value) {
-            lastSavedConfiguration = value
+    @discardableResult
+    func save() -> Bool {
+        pendingSaveTask?.cancel()
+        pendingSaveTask = nil
+        // Assigning a reconciled conflict draft also triggers SwiftUI's
+        // `onChange`. Do not interpret that programmatic notification as the
+        // user's decision to overwrite the other process's edit. A subsequent
+        // real edit changes the value and becomes an explicit retry.
+        if let conflictedDraft {
+            guard configuration != conflictedDraft else { return false }
+            self.conflictedDraft = nil
+            hasPendingConfigurationConflict = false
+        }
+        // Keep an over-capacity draft visible and uncommitted. Normalizing first
+        // would truncate the newest row and make this save appear successful.
+        guard configuration.isWithinStorageCapacity else { return false }
+        let value = configuration.validatedAndNormalized()
+        if configuration != value {
+            configuration = value
+        }
+        guard value != lastSavedConfiguration else {
+            hasPendingConfigurationConflict = false
+            return true
+        }
+
+        isSavingConfiguration = true
+        defer { isSavingConfiguration = false }
+        var draft = value
+        var baseConfiguration = lastSavedConfiguration
+        var baseSnapshot = configurationSnapshot
+
+        // A bounded retry combines independent edits while CAS still protects
+        // against a continuously changing writer. Same-field conflicts stay as
+        // an uncommitted visible draft instead of silently choosing either side.
+        for _ in 0..<3 {
+            let result = ConfigurationStore.save(
+                draft,
+                basedOn: baseSnapshot,
+                defaults: configurationDefaults,
+                publish: publishConfigurationChanges
+            )
+            if let committed = result.committedSnapshot {
+                configurationSnapshot = committed
+                lastSavedConfiguration = committed.configuration
+                configuration = committed.configuration
+                conflictedDraft = nil
+                hasPendingConfigurationConflict = false
+                return true
+            }
+
+            guard case let .conflict(latest?) = result else {
+                // A transient storage failure keeps both the draft and its CAS
+                // baseline intact, allowing a later retry without data loss.
+                return false
+            }
+            let merged = ConfigurationDraftMerger.merge(
+                base: baseConfiguration,
+                local: draft,
+                remote: latest.configuration
+            )
+            configurationSnapshot = latest
+            lastSavedConfiguration = latest.configuration
+            configuration = merged.configuration
+            baseSnapshot = latest
+            baseConfiguration = latest.configuration
+            draft = merged.configuration
+
+            if merged.hasConflicts {
+                conflictedDraft = merged.configuration
+                hasPendingConfigurationConflict = true
+                return false
+            }
+            if merged.configuration == latest.configuration {
+                conflictedDraft = nil
+                hasPendingConfigurationConflict = false
+                return true
+            }
+        }
+        return false
+    }
+
+    /// 文本输入和滑块会在一次编辑中产生大量中间值，合并为一次
+    /// 原子写入。Toggle、Picker、删除和排序等离散操作仍直接调用 save()。
+    func saveDebounced() {
+        if let conflictedDraft {
+            guard configuration != conflictedDraft else { return }
+            self.conflictedDraft = nil
+            hasPendingConfigurationConflict = false
+        }
+        pendingSaveTask?.cancel()
+        pendingSaveTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .milliseconds(350))
+            guard !Task.isCancelled, let self else { return }
+            self.pendingSaveTask = nil
+            self.save()
+        }
+    }
+
+    private func receiveExternalSnapshot(_ snapshot: ConfigurationSnapshot) {
+        guard snapshot.isAuthoritative, snapshot != configurationSnapshot else { return }
+        let localDraft = configuration
+        let base = lastSavedConfiguration
+        let wasDirty = localDraft != base
+        let wasAlreadyConflicted = conflictedDraft == localDraft
+        pendingSaveTask?.cancel()
+        pendingSaveTask = nil
+        configurationSnapshot = snapshot
+        lastSavedConfiguration = snapshot.configuration
+
+        guard wasDirty else {
+            configuration = snapshot.configuration
+            conflictedDraft = nil
+            hasPendingConfigurationConflict = false
+            return
+        }
+
+        let merged = ConfigurationDraftMerger.merge(
+            base: base,
+            local: localDraft,
+            remote: snapshot.configuration
+        )
+        configuration = merged.configuration
+        if merged.hasConflicts || wasAlreadyConflicted {
+            conflictedDraft = merged.configuration
+            hasPendingConfigurationConflict = true
+        } else {
+            conflictedDraft = nil
+            hasPendingConfigurationConflict = false
+            if merged.configuration != snapshot.configuration, !isSavingConfiguration {
+                saveDebounced()
+            }
         }
     }
 
@@ -87,6 +234,9 @@ final class SettingsModel: ObservableObject {
         panel.canChooseFiles = true
         panel.allowsMultipleSelection = false
         guard panel.runModal() == .OK, let url = panel.url else { return }
+        // 模板导入由扩展修改同一份配置；先提交当前编辑，避免
+        // 尚未到期的 debounce 快照与导入结果产生不必要的 CAS 冲突。
+        save()
         ConfigurationStore.requestTemplateImport(url)
     }
 
@@ -243,12 +393,10 @@ final class SettingsModel: ObservableObject {
         panel.allowedContentTypes = [.image]
         guard panel.runModal() == .OK, let source = panel.url,
               let image = NSImage(contentsOf: source),
-              image.size.width > 0, image.size.height > 0 else { return }
-        let directory = FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent("Library/Application Support/SuperRightClick/Icons", isDirectory: true)
+              image.size.width > 0, image.size.height > 0,
+              configuration.actionPreferences.contains(where: { $0.action == action }) else { return }
+        let oldPath = configuration.preference(for: action).customIconPath
         do {
-            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-            let destination = directory.appendingPathComponent("\(action.rawValue).png")
             let resized = NSImage(size: NSSize(width: 128, height: 128))
             let scale = min(128 / image.size.width, 128 / image.size.height)
             let drawSize = NSSize(width: image.size.width * scale, height: image.size.height * scale)
@@ -269,11 +417,22 @@ final class SettingsModel: ObservableObject {
             guard let tiff = resized.tiffRepresentation,
                   let bitmap = NSBitmapImageRep(data: tiff),
                   let png = bitmap.representation(using: .png, properties: [:]) else { return }
-            try png.write(to: destination, options: .atomic)
-            if let index = configuration.actionPreferences.firstIndex(where: { $0.action == action }) {
-                configuration.actionPreferences[index].customIconPath = destination.path
+            _ = try ManagedCustomIconStore.install(
+                pngData: png,
+                for: action,
+                replacing: oldPath
+            ) { [weak self] newPath in
+                guard let self,
+                      let index = self.configuration.actionPreferences.firstIndex(where: {
+                          $0.action == action
+                      }) else { return false }
+                self.configuration.actionPreferences[index].customIconPath = newPath
+                guard self.save() else {
+                    self.restoreIconDraftAfterFailedCommit(for: action, previousPath: oldPath)
+                    return false
+                }
+                return self.configuration.preference(for: action).customIconPath == newPath
             }
-            save()
         } catch {
             let alert = NSAlert()
             alert.alertStyle = .critical
@@ -285,17 +444,38 @@ final class SettingsModel: ObservableObject {
     }
 
     func clearCustomIcon(for action: FinderMenuAction) {
-        if let index = configuration.actionPreferences.firstIndex(where: { $0.action == action }) {
-            let expectedURL = FileManager.default.homeDirectoryForCurrentUser
-                .appendingPathComponent("Library/Application Support/SuperRightClick/Icons", isDirectory: true)
-                .appendingPathComponent("\(action.rawValue).png")
-                .standardizedFileURL
-            if let storedPath = configuration.actionPreferences[index].customIconPath,
-               URL(fileURLWithPath: storedPath).standardizedFileURL == expectedURL {
-                try? FileManager.default.removeItem(at: expectedURL)
+        guard let index = configuration.actionPreferences.firstIndex(where: {
+            $0.action == action
+        }) else { return }
+        let oldPath = configuration.actionPreferences[index].customIconPath
+        _ = ManagedCustomIconStore.clear(path: oldPath, for: action) { [weak self] in
+            guard let self,
+                  let currentIndex = self.configuration.actionPreferences.firstIndex(where: {
+                      $0.action == action
+                  }) else { return false }
+            self.configuration.actionPreferences[currentIndex].customIconPath = nil
+            guard self.save() else {
+                self.restoreIconDraftAfterFailedCommit(for: action, previousPath: oldPath)
+                return false
             }
-            configuration.actionPreferences[index].customIconPath = nil
-            save()
+            return self.configuration.preference(for: action).customIconPath == nil
+        }
+    }
+
+    private func restoreIconDraftAfterFailedCommit(
+        for action: FinderMenuAction,
+        previousPath: String?
+    ) {
+        guard let index = configuration.actionPreferences.firstIndex(where: {
+            $0.action == action
+        }) else { return }
+        configuration.actionPreferences[index].customIconPath = hasPendingConfigurationConflict
+            ? lastSavedConfiguration.preference(for: action).customIconPath
+            : previousPath
+        if hasPendingConfigurationConflict {
+            // Keep the marker aligned with the rolled-back visible draft so the
+            // resulting SwiftUI change cannot auto-save over the conflict winner.
+            conflictedDraft = configuration
         }
     }
 
@@ -344,19 +524,29 @@ struct ContentView: View {
     @StateObject private var model = SettingsModel()
 
     var body: some View {
-        TabView {
-            statusView
-                .tabItem { Text(t("状态")) }
-            templatesView
-                .tabItem { Text(t("新建文件")) }
-            directoriesView
-                .tabItem { Text(t("目录")) }
-            menuSettingsView
-                .tabItem { Text(t("菜单")) }
-            imageSettingsView
-                .tabItem { Text(t("图片")) }
-            safetyView
-                .tabItem { Text(t("高级")) }
+        VStack(spacing: 8) {
+            if model.hasPendingConfigurationConflict {
+                Label(
+                    t("配置已被其他进程更新，请重试。"),
+                    systemImage: "exclamationmark.triangle.fill"
+                )
+                .font(.callout)
+                .foregroundStyle(.orange)
+            }
+            TabView {
+                statusView
+                    .tabItem { Text(t("状态")) }
+                templatesView
+                    .tabItem { Text(t("新建文件")) }
+                directoriesView
+                    .tabItem { Text(t("目录")) }
+                menuSettingsView
+                    .tabItem { Text(t("菜单")) }
+                imageSettingsView
+                    .tabItem { Text(t("图片")) }
+                safetyView
+                    .tabItem { Text(t("高级")) }
+            }
         }
         .padding(20)
         .frame(minWidth: 820, minHeight: 600)
@@ -423,6 +613,7 @@ struct ContentView: View {
                             Toggle(t("启用"), isOn: $template.isEnabled)
                                 .labelsHidden()
                                 .help(t("在新建文件菜单中显示此模板"))
+                                .onChange(of: template.isEnabled) { _, _ in model.save() }
                             TextField(t("模板名称"), text: $template.name)
                                 .textFieldStyle(.roundedBorder)
                                 .frame(minWidth: 110)
@@ -440,7 +631,9 @@ struct ContentView: View {
                                 Text(t("代码")).tag(Optional(3))
                             }
                             .frame(width: 108)
+                            .onChange(of: template.iconVariant) { _, _ in model.save() }
                             Toggle(t("一级菜单"), isOn: $template.showInMainMenu)
+                                .onChange(of: template.showInMainMenu) { _, _ in model.save() }
                             Button(t("删除"), role: .destructive) {
                                 model.removeTemplate(id: template.id)
                             }
@@ -455,7 +648,7 @@ struct ContentView: View {
                 .frame(minHeight: 260)
             }
         }
-        .onChange(of: model.configuration) { _, _ in model.save() }
+        .onChange(of: model.configuration) { _, _ in model.saveDebounced() }
     }
 
     private var directoriesView: some View {
@@ -478,7 +671,7 @@ struct ContentView: View {
                 openWithAppList
             }
         }
-        .onChange(of: model.configuration) { _, _ in model.save() }
+        .onChange(of: model.configuration) { _, _ in model.saveDebounced() }
     }
 
     private var openWithAppList: some View {
@@ -487,7 +680,9 @@ struct ContentView: View {
                 List {
                     ForEach($model.configuration.openWithApps) { $app in
                         HStack(spacing: 8) {
-                            Toggle("", isOn: $app.isEnabled).labelsHidden()
+                            Toggle("", isOn: $app.isEnabled)
+                                .labelsHidden()
+                                .onChange(of: app.isEnabled) { _, _ in model.save() }
                             Image(nsImage: NSWorkspace.shared.icon(forFile: app.appURL.path))
                                 .resizable()
                                 .frame(width: 22, height: 22)
@@ -553,7 +748,9 @@ struct ContentView: View {
             List {
                 ForEach($model.configuration.actionPreferences) { $preference in
                     HStack {
-                        Toggle("", isOn: $preference.isEnabled).labelsHidden()
+                        Toggle("", isOn: $preference.isEnabled)
+                            .labelsHidden()
+                            .onChange(of: preference.isEnabled) { _, _ in model.save() }
                         Text(t(preference.action.title))
                             .frame(width: 160, alignment: .leading)
                         TextField(t("自定义名称"), text: Binding(
@@ -561,6 +758,7 @@ struct ContentView: View {
                             set: { preference.customName = $0.isEmpty ? nil : $0 }
                         ))
                         Toggle(t("图标"), isOn: $preference.showIcon)
+                            .onChange(of: preference.showIcon) { _, _ in model.save() }
                         Button(t("自定义图标…")) {
                             model.chooseCustomIcon(for: preference.action)
                         }
@@ -580,7 +778,7 @@ struct ContentView: View {
                 }
             }
         }
-        .onChange(of: model.configuration) { _, _ in model.save() }
+        .onChange(of: model.configuration) { _, _ in model.saveDebounced() }
     }
 
     private var imageSettingsView: some View {
@@ -592,12 +790,20 @@ struct ContentView: View {
             Section(t("图片转换")) {
                 HStack {
                     Text(t("有损格式质量"))
-                    Slider(value: binding(\.imageQuality), in: 0.1...1, step: 0.05)
+                    Slider(
+                        value: binding(\.imageQuality, saveImmediately: false),
+                        in: 0.1...1,
+                        step: 0.05
+                    )
                     Text("\(Int(model.configuration.imageQuality * 100))%")
                         .monospacedDigit()
                         .frame(width: 45)
                 }
-                TextField(t("JPG 透明背景填充色（#RRGGBB）"), text: binding(\.jpgBackgroundHex))
+                TextField(
+                    t("JPG 透明背景填充色（#RRGGBB）"),
+                    text: binding(\.jpgBackgroundHex, saveImmediately: false)
+                )
+                .onSubmit { model.save() }
                 Toggle(t("墙纸应用到全部屏幕"), isOn: binding(\.wallpaperAllScreens))
                 Text(t("转换结果保存在源图片旁边；同名时自动追加序号。"))
                     .font(.caption)
@@ -664,7 +870,9 @@ struct ContentView: View {
                 List {
                     ForEach(values) { $value in
                         HStack(spacing: 8) {
-                            Toggle("", isOn: $value.isEnabled).labelsHidden()
+                            Toggle("", isOn: $value.isEnabled)
+                                .labelsHidden()
+                                .onChange(of: value.isEnabled) { _, _ in model.save() }
                             VStack(alignment: .leading, spacing: 2) {
                                 TextField(t("菜单显示名称"), text: directoryNameBinding($value))
                                     .onSubmit { model.save() }
@@ -721,12 +929,19 @@ struct ContentView: View {
         )
     }
 
-    private func binding<Value>(_ keyPath: WritableKeyPath<MenuConfiguration, Value>) -> Binding<Value> {
+    private func binding<Value>(
+        _ keyPath: WritableKeyPath<MenuConfiguration, Value>,
+        saveImmediately: Bool = true
+    ) -> Binding<Value> {
         Binding(
             get: { model.configuration[keyPath: keyPath] },
             set: {
                 model.configuration[keyPath: keyPath] = $0
-                model.save()
+                if saveImmediately {
+                    model.save()
+                } else {
+                    model.saveDebounced()
+                }
             }
         )
     }

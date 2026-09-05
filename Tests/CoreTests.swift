@@ -505,16 +505,16 @@ final class CoreTests: XCTestCase {
     }
 
     @MainActor
-    func testCopyAndMoveUseConflictSafeNames() throws {
+    func testCopyAndMoveUseConflictSafeNames() async throws {
         let coordinator = makeCoordinator()
         let source = root.appendingPathComponent("source.txt")
         try Data("one".utf8).write(to: source)
         let destination = root.appendingPathComponent("destination", isDirectory: true)
-        coordinator.transfer([source], to: destination, move: false)
+        await coordinator.transferAndWait([source], to: destination, move: false)
         XCTAssertTrue(FileManager.default.fileExists(
             atPath: destination.appendingPathComponent("source.txt").path
         ))
-        coordinator.transfer([source], to: destination, move: true)
+        await coordinator.transferAndWait([source], to: destination, move: true)
         XCTAssertFalse(FileManager.default.fileExists(atPath: source.path))
         XCTAssertTrue(FileManager.default.fileExists(
             atPath: destination.appendingPathComponent("source 2.txt").path
@@ -553,7 +553,7 @@ final class CoreTests: XCTestCase {
     }
 
     @MainActor
-    func testCutHideRestoresAndPasteMakesDestinationVisible() throws {
+    func testCutHideRestoresAndPasteMakesDestinationVisible() async throws {
         let coordinator = makeCoordinator()
         var configuration = MenuConfiguration.default
         configuration.hideCutItems = true
@@ -579,7 +579,7 @@ final class CoreTests: XCTestCase {
         )
 
         let destination = root.appendingPathComponent("destination", isDirectory: true)
-        coordinator.paste(into: destination)
+        await coordinator.pasteAndWait(into: destination)
         let pasted = destination.appendingPathComponent("second.txt")
         XCTAssertTrue(FileManager.default.fileExists(atPath: pasted.path))
         XCTAssertEqual(
@@ -998,7 +998,7 @@ final class CoreTests: XCTestCase {
         XCTAssertEqual(try Data(contentsOf: target), Data("replacement".utf8))
         XCTAssertEqual(try Data(contentsOf: originalBackup), Data("original".utf8))
         XCTAssertEqual(presentedErrors.count, 1)
-        XCTAssertTrue(presentedErrors[0].contains("identity verification"))
+        XCTAssertTrue(presentedErrors[0].contains("final commit"))
         XCTAssertFalse(try FileManager.default.contentsOfDirectory(atPath: root.path).contains {
             $0.hasPrefix(".superrightclick-delete-")
         })
@@ -1036,7 +1036,7 @@ final class CoreTests: XCTestCase {
         try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
         let child = folder.appendingPathComponent("child.txt")
         try Data("content".utf8).write(to: child)
-        coordinator.dissolve(folder)
+        await coordinator.dissolveAndWait(folder)
         XCTAssertFalse(FileManager.default.fileExists(atPath: folder.path))
         let moved = parent.appendingPathComponent("child.txt")
         XCTAssertTrue(FileManager.default.fileExists(atPath: moved.path))
