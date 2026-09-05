@@ -6,7 +6,7 @@
 
 **简洁、可配置、注重隐私的 macOS Finder 右键菜单增强工具**
 
-![简体中文](https://img.shields.io/badge/简体中文-当前语言-4F46E5?style=for-the-badge) ![English](https://img.shields.io/badge/English-Switch-64748B?style=for-the-badge)
+![简体中文](https://img.shields.io/badge/简体中文-当前语言-4F46E5?style=for-the-badge) [![切换到 English](https://img.shields.io/badge/English-Switch-64748B?style=for-the-badge)](./README_EN.md)
 
 [![下载最新 DMG](https://img.shields.io/badge/下载最新版本-DMG-2563EB?style=for-the-badge&logo=github)](https://github.com/zijielou/SuperRightClick/releases/latest)
 
